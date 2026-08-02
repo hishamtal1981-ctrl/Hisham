@@ -18,7 +18,7 @@ from pydantic import BaseModel
 ROOT = Path(__file__).resolve().parent
 DB_NAME = os.getenv("SQLSERVER_DATABASE", "Maintenance Contract")
 DB_SERVER = os.getenv("SQLSERVER_HOST", "localhost")
-SESSIONS: dict[str, str] = {}
+SESSIONS: dict[str, dict[str, str]] = {}
 
 
 class SqlCursor:
@@ -57,9 +57,9 @@ class SqlConnection:
 def db():
     import pyodbc
     connection_string = (
-        "DRIVER={ODBC Driver 17 for SQL Server};"
+        "DRIVER={ODBC Driver 18 for SQL Server};"
         f"SERVER={DB_SERVER};DATABASE={DB_NAME};"
-        "Trusted_Connection=yes;Encrypt=no;TrustServerCertificate=yes;"
+        "Trusted_Connection=yes;Encrypt=Optional;TrustServerCertificate=yes;"
     )
     return SqlConnection(pyodbc.connect(connection_string))
 
@@ -100,19 +100,22 @@ app = FastAPI(title="Maintenance Contracts System")
 
 def auth(authorization: str | None) -> dict[str, Any]:
     token = (authorization or '').removeprefix('Bearer ').strip()
-    username = SESSIONS.get(token)
-    if not username:
+    session = SESSIONS.get(token)
+    if not session:
         raise HTTPException(401, 'Unauthorized')
     with db() as con:
-        user = con.execute('SELECT id,username,role,group_name,property_name FROM users WHERE username=?',(username,)).fetchone()
+        user = con.execute('SELECT id,username,role,group_name,property_name FROM users WHERE username=?',(session['username'],)).fetchone()
     if not user:
         raise HTTPException(401, 'Unauthorized')
-    return user
+    result = dict(user)
+    result['property_name'] = session['property_name']
+    return result
 
 
 class Login(BaseModel):
     username: str
     password: str
+    property_name: str = ''
 
 
 class Contract(BaseModel):
@@ -147,10 +150,23 @@ class NamedPayload(BaseModel):
 def login(payload: Login):
     with db() as con:
         row = con.execute('SELECT * FROM users WHERE username=?',(payload.username,)).fetchone()
+        selected_property = con.execute('SELECT name FROM properties WHERE name=?',(payload.property_name,)).fetchone() if payload.property_name else None
     if not row or row['password_hash'] != password_hash(payload.password):
         raise HTTPException(401, 'Invalid username or password')
-    token = secrets.token_urlsafe(32); SESSIONS[token] = row['username']
-    return {'token': token, 'user': {'username': row['username'], 'role': row['role'], 'property_name': row['property_name']}}
+    if row['role'] != 'admin' and not selected_property:
+        raise HTTPException(400, 'Please select a valid property')
+    if row['role'] != 'admin' and row['property_name'] and row['property_name'] != payload.property_name:
+        raise HTTPException(403, 'This user is not assigned to the selected property')
+    token = secrets.token_urlsafe(32)
+    selected_name = payload.property_name if selected_property else ''
+    SESSIONS[token] = {'username': row['username'], 'property_name': selected_name}
+    return {'token': token, 'user': {'username': row['username'], 'role': row['role'], 'property_name': selected_name}}
+
+
+@app.get('/api/auth/properties')
+def login_properties():
+    with db() as con:
+        return [dict(x) for x in con.execute('SELECT name,logo FROM properties ORDER BY name')]
 
 
 @app.get('/api/me')
@@ -169,8 +185,12 @@ def status_for(end_date: str) -> str:
 @app.get('/api/contracts')
 def list_contracts(include_archived: bool = False, authorization: str | None = Header(None)):
     user = auth(authorization)
-    sql, args = 'SELECT * FROM contracts WHERE archived=?', [1 if include_archived else 0]
-    if user['role'] != 'admin' and user['property_name']:
+    sql, args = '''SELECT id,name,contractor_name,contractor_phone,department,value,currency,
+        tax_percent,start_date,end_date,property_name,notes,archived,
+        CONVERT(NVARCHAR(40),created_at,127) AS created_at,
+        CONVERT(NVARCHAR(40),updated_at,127) AS updated_at
+        FROM contracts WHERE archived=?''', [1 if include_archived else 0]
+    if user['property_name']:
         sql += ' AND property_name=?'; args.append(user['property_name'])
     sql += ' ORDER BY end_date'
     with db() as con: rows = [dict(x) for x in con.execute(sql,args)]
@@ -180,11 +200,24 @@ def list_contracts(include_archived: bool = False, authorization: str | None = H
 
 @app.post('/api/contracts')
 def add_contract(payload: Contract, authorization: str | None = Header(None)):
-    auth(authorization); now = datetime.now(timezone.utc).isoformat(); data = payload.model_dump()
+    user = auth(authorization)
+    data = payload.model_dump()
+    if user['property_name']:
+        data['property_name'] = user['property_name']
+    if not data['property_name']:
+        raise HTTPException(400, 'Please select a property for this contract')
     with db() as con:
-        cur=con.execute('''INSERT INTO contracts(name,contractor_name,contractor_phone,department,value,currency,tax_percent,start_date,end_date,property_name,notes,created_at,updated_at) OUTPUT INSERTED.id VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',(*data.values(),now,now))
+        property_exists = con.execute('SELECT id FROM properties WHERE name=?',(data['property_name'],)).fetchone()
+    if not property_exists:
+        raise HTTPException(400, 'The selected property does not exist')
+    data['start_date'] = data['start_date'] or None
+    data['end_date'] = data['end_date'] or None
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as con:
+        cur=con.execute('''INSERT INTO contracts(name,contractor_name,contractor_phone,department,value,currency,tax_percent,start_date,end_date,property_name,notes,created_at,updated_at) OUTPUT INSERTED.id VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
+            data['name'],data['contractor_name'],data['contractor_phone'],data['department'],data['value'],data['currency'],data['tax_percent'],data['start_date'],data['end_date'],data['property_name'],data['notes'],now,now))
         contract_id=cur.fetchone()['id']
-    return {'success':True,'id':contract_id}
+    return {'success':True,'id':contract_id,'property_name':data['property_name']}
 
 
 @app.put('/api/contracts/{contract_id}')
