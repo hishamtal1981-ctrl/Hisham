@@ -4,7 +4,11 @@ if not exist .venv (
   py -m venv .venv
   .venv\Scripts\python.exe -m pip install -r requirements.txt
 )
-echo Open: http://AMMHLITM01:8000
+if "%SQLSERVER_HOST%"=="" (
+  sc query "MSSQL$SQLEXPRESS" | find "RUNNING" >nul
+  if not errorlevel 1 set "SQLSERVER_HOST=%COMPUTERNAME%\SQLEXPRESS"
+)
+echo Open: http://localhost:8000
 .venv\Scripts\python.exe -m uvicorn server:app --host 0.0.0.0 --port 8000
 if errorlevel 1 (
   echo.
