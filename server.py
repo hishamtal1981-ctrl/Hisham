@@ -5,7 +5,7 @@ import hashlib
 import io
 import json
 import secrets
-import sqlite3
+import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -16,14 +16,52 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = ROOT / "maintenance.db"
+DB_NAME = os.getenv("SQLSERVER_DATABASE", "Maintenance Contract")
+DB_SERVER = os.getenv("SQLSERVER_HOST", "localhost")
 SESSIONS: dict[str, str] = {}
 
 
-def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+class SqlCursor:
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    def _row(self, row):
+        if row is None:
+            return None
+        return dict(zip((column[0] for column in self.cursor.description), row))
+
+    def fetchone(self):
+        return self._row(self.cursor.fetchone())
+
+    def __iter__(self):
+        columns = [column[0] for column in self.cursor.description]
+        for row in self.cursor:
+            yield dict(zip(columns, row))
+
+
+class SqlConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.connection.rollback() if exc_type else self.connection.commit()
+        self.connection.close()
+
+    def execute(self, sql, params=()):
+        return SqlCursor(self.connection.cursor().execute(sql, params))
+
+
+def db():
+    import pyodbc
+    connection_string = (
+        "DRIVER={ODBC Driver 17 for SQL Server};"
+        f"SERVER={DB_SERVER};DATABASE={DB_NAME};"
+        "Trusted_Connection=yes;Encrypt=no;TrustServerCertificate=yes;"
+    )
+    return SqlConnection(pyodbc.connect(connection_string))
 
 
 def password_hash(value: str) -> str:
@@ -32,29 +70,35 @@ def password_hash(value: str) -> str:
 
 def init_db() -> None:
     with db() as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS properties(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, logo TEXT DEFAULT '', active INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS groups_tbl(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT DEFAULT '');
-        CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT DEFAULT 'user', group_name TEXT DEFAULT '', property_name TEXT DEFAULT '');
-        CREATE TABLE IF NOT EXISTS contracts(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, contractor_name TEXT NOT NULL,
-          contractor_phone TEXT DEFAULT '', department TEXT DEFAULT '', value REAL DEFAULT 0,
-          currency TEXT DEFAULT 'JD', tax_percent REAL DEFAULT 0, start_date TEXT, end_date TEXT,
-          property_name TEXT DEFAULT '', notes TEXT DEFAULT '', archived INTEGER DEFAULT 0,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        """)
-        con.execute("INSERT OR IGNORE INTO properties(name,active) VALUES('Hilton Amman',1)")
-        con.execute("INSERT OR IGNORE INTO groups_tbl(name,description) VALUES('Administrators','System administrators')")
-        con.execute("INSERT OR IGNORE INTO users(username,password_hash,role,group_name,property_name) VALUES(?,?,?,?,?)",
-                    ('admin', password_hash('Admin@123'), 'admin', 'Administrators', 'Hilton Amman'))
+        con.execute("""IF OBJECT_ID('properties','U') IS NULL CREATE TABLE properties(
+          id INT IDENTITY(1,1) PRIMARY KEY, name NVARCHAR(200) UNIQUE NOT NULL,
+          logo NVARCHAR(1000) NOT NULL DEFAULT '', active BIT NOT NULL DEFAULT 0)""")
+        con.execute("""IF OBJECT_ID('groups_tbl','U') IS NULL CREATE TABLE groups_tbl(
+          id INT IDENTITY(1,1) PRIMARY KEY, name NVARCHAR(200) UNIQUE NOT NULL,
+          description NVARCHAR(1000) NOT NULL DEFAULT '')""")
+        con.execute("""IF OBJECT_ID('users','U') IS NULL CREATE TABLE users(
+          id INT IDENTITY(1,1) PRIMARY KEY, username NVARCHAR(200) UNIQUE NOT NULL,
+          password_hash NVARCHAR(64) NOT NULL, role NVARCHAR(30) NOT NULL DEFAULT 'user',
+          group_name NVARCHAR(200) NOT NULL DEFAULT '', property_name NVARCHAR(200) NOT NULL DEFAULT '')""")
+        con.execute("""IF OBJECT_ID('contracts','U') IS NULL CREATE TABLE contracts(
+          id INT IDENTITY(1,1) PRIMARY KEY, name NVARCHAR(500) NOT NULL,
+          contractor_name NVARCHAR(500) NOT NULL, contractor_phone NVARCHAR(100) NOT NULL DEFAULT '',
+          department NVARCHAR(200) NOT NULL DEFAULT '', value DECIMAL(18,2) NOT NULL DEFAULT 0,
+          currency NVARCHAR(20) NOT NULL DEFAULT 'JD', tax_percent DECIMAL(8,2) NOT NULL DEFAULT 0,
+          start_date DATE NULL, end_date DATE NULL, property_name NVARCHAR(200) NOT NULL DEFAULT '',
+          notes NVARCHAR(MAX) NOT NULL DEFAULT '', archived BIT NOT NULL DEFAULT 0,
+          created_at DATETIMEOFFSET NOT NULL, updated_at DATETIMEOFFSET NOT NULL)""")
+        con.execute("IF NOT EXISTS(SELECT 1 FROM properties WHERE name=?) INSERT INTO properties(name,active) VALUES(?,1)", ('Hilton Amman','Hilton Amman'))
+        con.execute("IF NOT EXISTS(SELECT 1 FROM groups_tbl WHERE name=?) INSERT INTO groups_tbl(name,description) VALUES(?,?)", ('Administrators','Administrators','System administrators'))
+        con.execute("IF NOT EXISTS(SELECT 1 FROM users WHERE username=?) INSERT INTO users(username,password_hash,role,group_name,property_name) VALUES(?,?,?,?,?)",
+                    ('admin','admin', password_hash('Admin@123'), 'admin', 'Administrators', 'Hilton Amman'))
 
 
 init_db()
 app = FastAPI(title="Maintenance Contracts System")
 
 
-def auth(authorization: str | None) -> sqlite3.Row:
+def auth(authorization: str | None) -> dict[str, Any]:
     token = (authorization or '').removeprefix('Bearer ').strip()
     username = SESSIONS.get(token)
     if not username:
@@ -115,7 +159,9 @@ def me(authorization: str | None = Header(None)):
 
 
 def status_for(end_date: str) -> str:
-    try: days = (date.fromisoformat(end_date) - date.today()).days
+    try:
+        parsed = end_date if isinstance(end_date, date) else date.fromisoformat(str(end_date))
+        days = (parsed - date.today()).days
     except Exception: return 'active'
     return 'expired' if days < 0 else ('expiring_soon' if days <= 30 else 'active')
 
@@ -136,8 +182,9 @@ def list_contracts(include_archived: bool = False, authorization: str | None = H
 def add_contract(payload: Contract, authorization: str | None = Header(None)):
     auth(authorization); now = datetime.now(timezone.utc).isoformat(); data = payload.model_dump()
     with db() as con:
-        cur=con.execute('''INSERT INTO contracts(name,contractor_name,contractor_phone,department,value,currency,tax_percent,start_date,end_date,property_name,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',(*data.values(),now,now))
-    return {'success':True,'id':cur.lastrowid}
+        cur=con.execute('''INSERT INTO contracts(name,contractor_name,contractor_phone,department,value,currency,tax_percent,start_date,end_date,property_name,notes,created_at,updated_at) OUTPUT INSERTED.id VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',(*data.values(),now,now))
+        contract_id=cur.fetchone()['id']
+    return {'success':True,'id':contract_id}
 
 
 @app.put('/api/contracts/{contract_id}')
@@ -162,7 +209,7 @@ def stats(authorization: str | None = Header(None)):
     return counts
 
 
-def admin(authorization: str | None) -> sqlite3.Row:
+def admin(authorization: str | None) -> dict[str, Any]:
     user=auth(authorization)
     if user['role']!='admin': raise HTTPException(403,'Admin required')
     return user
@@ -218,7 +265,7 @@ def activate_property(name:str, authorization: str | None = Header(None)):
 @app.get('/api/active-property')
 def active_property(authorization: str | None = Header(None)):
     auth(authorization)
-    with db() as con: row=con.execute('SELECT * FROM properties WHERE active=1 LIMIT 1').fetchone()
+    with db() as con: row=con.execute('SELECT TOP 1 * FROM properties WHERE active=1').fetchone()
     return dict(row) if row else {'name':'Maintenance Contracts','logo':''}
 
 
@@ -241,4 +288,3 @@ app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 
 @app.get('/')
 def home(): return FileResponse(ROOT/'static/index.html')
-

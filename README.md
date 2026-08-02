@@ -1,6 +1,6 @@
 # Maintenance Contracts System
 
-نسخة مستقلة من نظام إدارة عقود الصيانة، تعمل محليًا بقاعدة SQLite ولا تعتمد على CodeWords.
+نسخة مستقلة من نظام إدارة عقود الصيانة، تعمل مع Microsoft SQL Server ولا تعتمد على CodeWords.
 
 ## التشغيل
 
@@ -16,4 +16,4 @@ uvicorn server:app --reload
 - المستخدم الابتدائي: `admin`
 - كلمة المرور الابتدائية: `Admin@123`
 
-غيّر كلمة المرور قبل الاستخدام الفعلي. قاعدة البيانات محفوظة في `maintenance.db` وتُنشأ تلقائيًا.
+غيّر كلمة المرور قبل الاستخدام الفعلي. يستخدم البرنامج Windows Authentication ويتصل افتراضيًا بالخادم `localhost` وقاعدة `[Maintenance Contract]`. يمكن تغييرهما من متغيري البيئة `SQLSERVER_HOST` و`SQLSERVER_DATABASE`.
