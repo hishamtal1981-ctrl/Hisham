@@ -9,6 +9,7 @@ import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -96,6 +97,10 @@ def init_db() -> None:
           start_date DATE NULL, end_date DATE NULL, property_name NVARCHAR(200) NOT NULL DEFAULT '',
           notes NVARCHAR(MAX) NOT NULL DEFAULT '', archived BIT NOT NULL DEFAULT 0,
           created_at DATETIMEOFFSET NOT NULL, updated_at DATETIMEOFFSET NOT NULL)""")
+        con.execute("IF COL_LENGTH('contracts','attachment_name') IS NULL ALTER TABLE contracts ADD attachment_name NVARCHAR(500) NULL")
+        con.execute("IF COL_LENGTH('contracts','attachment_content_type') IS NULL ALTER TABLE contracts ADD attachment_content_type NVARCHAR(200) NULL")
+        con.execute("IF COL_LENGTH('contracts','attachment_data') IS NULL ALTER TABLE contracts ADD attachment_data VARBINARY(MAX) NULL")
+        con.execute("IF COL_LENGTH('contracts','attachment_size') IS NULL ALTER TABLE contracts ADD attachment_size BIGINT NULL")
         con.execute("IF NOT EXISTS(SELECT 1 FROM properties WHERE name=?) INSERT INTO properties(name,active) VALUES(?,1)", ('Hilton Amman','Hilton Amman'))
         con.execute("IF NOT EXISTS(SELECT 1 FROM groups_tbl WHERE name=?) INSERT INTO groups_tbl(name,description) VALUES(?,?)", ('Administrators','Administrators','System administrators'))
         con.execute("IF NOT EXISTS(SELECT 1 FROM users WHERE username=?) INSERT INTO users(username,password_hash,role,group_name,property_name) VALUES(?,?,?,?,?)",
@@ -224,6 +229,8 @@ def list_contracts(include_archived: bool = False, authorization: str | None = H
     user = auth(authorization)
     sql, args = '''SELECT id,name,contractor_name,contractor_phone,department,value,currency,
         tax_percent,start_date,end_date,property_name,notes,archived,
+        attachment_name,attachment_content_type,attachment_size,
+        CASE WHEN attachment_data IS NULL THEN CAST(0 AS BIT) ELSE CAST(1 AS BIT) END AS has_attachment,
         CONVERT(NVARCHAR(40),created_at,127) AS created_at,
         CONVERT(NVARCHAR(40),updated_at,127) AS updated_at
         FROM contracts WHERE archived=?''', [1 if include_archived else 0]
@@ -282,6 +289,49 @@ def edit_contract(contract_id: int, payload: Contract, authorization: str | None
         con.execute('''UPDATE contracts SET name=?,contractor_name=?,contractor_phone=?,department=?,value=?,currency=?,tax_percent=?,start_date=?,end_date=?,property_name=?,notes=?,updated_at=? WHERE id=?''',(
             data['name'],data['contractor_name'],data['contractor_phone'],data['department'],data['value'],data['currency'],data['tax_percent'],data['start_date'],data['end_date'],data['property_name'],data['notes'],now,contract_id))
     return {'success':True}
+
+
+MAX_ATTACHMENT_SIZE = 25 * 1024 * 1024
+
+
+@app.post('/api/contracts/{contract_id}/attachment')
+async def upload_contract_attachment(contract_id: int, file: UploadFile = File(...), authorization: str | None = Header(None)):
+    user = auth(authorization)
+    contract_access(user, contract_id)
+    data = await file.read(MAX_ATTACHMENT_SIZE + 1)
+    if not data:
+        raise HTTPException(400, 'Please select a non-empty attachment')
+    if len(data) > MAX_ATTACHMENT_SIZE:
+        raise HTTPException(413, 'Attachment size cannot exceed 25 MB')
+    filename = Path(file.filename or 'attachment').name[:500]
+    content_type = (file.content_type or 'application/octet-stream')[:200]
+    with db() as con:
+        con.execute('''UPDATE contracts SET attachment_name=?,attachment_content_type=?,attachment_data=?,attachment_size=?,updated_at=? WHERE id=?''',
+                    (filename, content_type, data, len(data), datetime.now(timezone.utc).isoformat(), contract_id))
+    return {'success': True, 'filename': filename, 'size': len(data)}
+
+
+@app.get('/api/contracts/{contract_id}/attachment')
+def download_contract_attachment(contract_id: int, authorization: str | None = Header(None)):
+    user = auth(authorization)
+    contract_access(user, contract_id)
+    with db() as con:
+        row = con.execute('SELECT attachment_name,attachment_content_type,attachment_data FROM contracts WHERE id=?',(contract_id,)).fetchone()
+    if not row or row['attachment_data'] is None:
+        raise HTTPException(404, 'This contract has no attachment')
+    filename = row['attachment_name'] or 'attachment'
+    disposition = "attachment; filename*=UTF-8''" + quote(filename)
+    return StreamingResponse(io.BytesIO(bytes(row['attachment_data'])), media_type=row['attachment_content_type'] or 'application/octet-stream', headers={'Content-Disposition': disposition})
+
+
+@app.delete('/api/contracts/{contract_id}/attachment')
+def delete_contract_attachment(contract_id: int, authorization: str | None = Header(None)):
+    user = auth(authorization)
+    contract_access(user, contract_id)
+    with db() as con:
+        con.execute('UPDATE contracts SET attachment_name=NULL,attachment_content_type=NULL,attachment_data=NULL,attachment_size=NULL,updated_at=? WHERE id=?',
+                    (datetime.now(timezone.utc).isoformat(), contract_id))
+    return {'success': True}
 
 
 @app.delete('/api/contracts/{contract_id}')
