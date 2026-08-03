@@ -25,25 +25,25 @@ $form = [Windows.Forms.Form]@{
     Text = 'Maintenance Contract - Setup Wizard'
     Size = [Drawing.Size]::new(720, 610)
     StartPosition = 'CenterScreen'
-    RightToLeft = 'Yes'
-    RightToLeftLayout = $true
+    RightToLeft = 'No'
+    RightToLeftLayout = $false
     Font = [Drawing.Font]::new('Segoe UI', 10)
 }
 
-$title = [Windows.Forms.Label]@{Text='معالج تثبيت نظام عقود الصيانة';AutoSize=$true;Location=[Drawing.Point]::new(230,20);Font=[Drawing.Font]::new('Segoe UI',16,[Drawing.FontStyle]::Bold)}
-$pathLabel = [Windows.Forms.Label]@{Text='مجلد التثبيت';AutoSize=$true;Location=[Drawing.Point]::new(590,75)}
-$pathBox = [Windows.Forms.TextBox]@{Text='C:\MaintenanceContract';Location=[Drawing.Point]::new(100,72);Size=[Drawing.Size]::new(470,28);RightToLeft='No'}
-$serverLabel = [Windows.Forms.Label]@{Text='خادم SQL';AutoSize=$true;Location=[Drawing.Point]::new(590,115)}
-$serverBox = [Windows.Forms.TextBox]@{Location=[Drawing.Point]::new(100,112);Size=[Drawing.Size]::new(470,28);RightToLeft='No'}
-$databaseLabel = [Windows.Forms.Label]@{Text='قاعدة البيانات';AutoSize=$true;Location=[Drawing.Point]::new(590,155)}
-$databaseBox = [Windows.Forms.TextBox]@{Text='Maintenance Contract';Location=[Drawing.Point]::new(100,152);Size=[Drawing.Size]::new(470,28);RightToLeft='No'}
-$portLabel = [Windows.Forms.Label]@{Text='منفذ البرنامج';AutoSize=$true;Location=[Drawing.Point]::new(590,195)}
-$portBox = [Windows.Forms.NumericUpDown]@{Value=8000;Minimum=1024;Maximum=65535;Location=[Drawing.Point]::new(450,192);Size=[Drawing.Size]::new(120,28)}
-$installSql = [Windows.Forms.CheckBox]@{Text='تثبيت SQL Server Express تلقائيًا إذا لم يوجد';Checked=$true;AutoSize=$true;Location=[Drawing.Point]::new(345,235)}
-$license = [Windows.Forms.CheckBox]@{Text='أوافق على شروط ترخيص Microsoft SQL Server وODBC عند التثبيت التلقائي';Checked=$false;AutoSize=$true;Location=[Drawing.Point]::new(170,270)}
+$title = [Windows.Forms.Label]@{Text='Maintenance Contract Setup Wizard';AutoSize=$true;Location=[Drawing.Point]::new(195,20);Font=[Drawing.Font]::new('Segoe UI',16,[Drawing.FontStyle]::Bold)}
+$pathLabel = [Windows.Forms.Label]@{Text='Installation folder';AutoSize=$true;Location=[Drawing.Point]::new(35,75)}
+$pathBox = [Windows.Forms.TextBox]@{Text='C:\MaintenanceContract';Location=[Drawing.Point]::new(180,72);Size=[Drawing.Size]::new(490,28);RightToLeft='No'}
+$serverLabel = [Windows.Forms.Label]@{Text='SQL Server';AutoSize=$true;Location=[Drawing.Point]::new(35,115)}
+$serverBox = [Windows.Forms.TextBox]@{Location=[Drawing.Point]::new(180,112);Size=[Drawing.Size]::new(490,28);RightToLeft='No'}
+$databaseLabel = [Windows.Forms.Label]@{Text='Database name';AutoSize=$true;Location=[Drawing.Point]::new(35,155)}
+$databaseBox = [Windows.Forms.TextBox]@{Text='Maintenance Contract';Location=[Drawing.Point]::new(180,152);Size=[Drawing.Size]::new(490,28);RightToLeft='No'}
+$portLabel = [Windows.Forms.Label]@{Text='Application port';AutoSize=$true;Location=[Drawing.Point]::new(35,195)}
+$portBox = [Windows.Forms.NumericUpDown]@{Value=8000;Minimum=1024;Maximum=65535;Location=[Drawing.Point]::new(180,192);Size=[Drawing.Size]::new(120,28)}
+$installSql = [Windows.Forms.CheckBox]@{Text='Install SQL Server Express automatically when it is not found';Checked=$true;AutoSize=$true;Location=[Drawing.Point]::new(35,235)}
+$license = [Windows.Forms.CheckBox]@{Text='I accept the Microsoft SQL Server and ODBC license terms for automatic installation';Checked=$false;AutoSize=$true;Location=[Drawing.Point]::new(35,270)}
 $logBox = [Windows.Forms.TextBox]@{Multiline=$true;ReadOnly=$true;ScrollBars='Vertical';Location=[Drawing.Point]::new(35,315);Size=[Drawing.Size]::new(635,180);RightToLeft='No'}
-$installButton = [Windows.Forms.Button]@{Text='تثبيت';Location=[Drawing.Point]::new(475,520);Size=[Drawing.Size]::new(120,36)}
-$cancelButton = [Windows.Forms.Button]@{Text='إغلاق';Location=[Drawing.Point]::new(335,520);Size=[Drawing.Size]::new(120,36)}
+$installButton = [Windows.Forms.Button]@{Text='Install';Location=[Drawing.Point]::new(405,520);Size=[Drawing.Size]::new(120,36)}
+$cancelButton = [Windows.Forms.Button]@{Text='Close';Location=[Drawing.Point]::new(545,520);Size=[Drawing.Size]::new(120,36)}
 
 $form.Controls.AddRange(@($title,$pathLabel,$pathBox,$serverLabel,$serverBox,$databaseLabel,$databaseBox,$portLabel,$portBox,$installSql,$license,$logBox,$installButton,$cancelButton))
 $cancelButton.Add_Click({$form.Close()})
@@ -168,12 +168,12 @@ if ($detected) { $serverBox.Text = $detected } else { $serverBox.Text = '.\MAINT
 
 $installButton.Add_Click({
     try {
-        if ($installSql.Checked -and -not $license.Checked) { throw 'يجب الموافقة على شروط Microsoft قبل التثبيت التلقائي.' }
+        if ($installSql.Checked -and -not $license.Checked) { throw 'You must accept the Microsoft license terms before automatic installation.' }
         $installButton.Enabled = $false
         $target = $pathBox.Text.Trim()
         $database = $databaseBox.Text.Trim()
         $port = [int]$portBox.Value
-        if (-not $target -or -not $database) { throw 'مجلد التثبيت واسم قاعدة البيانات مطلوبان.' }
+        if (-not $target -or -not $database) { throw 'The installation folder and database name are required.' }
         $sqlServer = Find-SqlServer
         if (-not $sqlServer) {
             if (-not $installSql.Checked) { $sqlServer = $serverBox.Text.Trim() }
@@ -260,7 +260,7 @@ set "SQLSERVER_DATABASE=$database"
         Write-SetupLog "Network IP URL: $networkUrl"
         Write-SetupLog "Computer name URL: $computerUrl"
         Start-Process $localUrl
-        [Windows.Forms.MessageBox]::Show("تم التثبيت وفتح البرنامج بنجاح.`nعلى هذا الجهاز: $localUrl`nمن أجهزة الشبكة: $networkUrl`nباسم الجهاز: $computerUrl",'Maintenance Contract') | Out-Null
+        [Windows.Forms.MessageBox]::Show("Installation completed and the application opened successfully.`nThis computer: $localUrl`nNetwork clients: $networkUrl`nComputer name: $computerUrl",'Maintenance Contract') | Out-Null
     } catch {
         Write-SetupLog "ERROR: $($_.Exception.Message)"
         [Windows.Forms.MessageBox]::Show($_.Exception.Message,'Setup failed','OK','Error') | Out-Null
