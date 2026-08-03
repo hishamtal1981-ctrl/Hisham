@@ -217,9 +217,9 @@ set "SQLSERVER_DATABASE=$database"
 "@
         Set-Content -Path (Join-Path $target 'run-server.cmd') -Value $runner -Encoding ASCII
         $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/c "{0}"' -f (Join-Path $target 'run-server.cmd')) -WorkingDirectory $target
-        $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
-        $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
+        Stop-ScheduledTask -TaskName 'Maintenance Contract Server' -ErrorAction SilentlyContinue
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName 'Maintenance Contract Server' -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
         $firewallRule = Get-NetFirewallRule -DisplayName 'Maintenance Contract Web' -ErrorAction SilentlyContinue
         if (-not $firewallRule) {
