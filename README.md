@@ -13,7 +13,9 @@ uvicorn server:app --reload
 
 افتح `http://127.0.0.1:8000`.
 
+للتثبيت السريع على Windows، شغّل `setup_database.bat` مرة واحدة ثم `start.bat`. ينشئ ملف التشغيل بيئة Python ويثبت المتطلبات تلقائيًا في أول مرة.
+
 - المستخدم الابتدائي: `admin`
 - كلمة المرور الابتدائية: `Admin@123`
 
-غيّر كلمة المرور قبل الاستخدام الفعلي. يستخدم البرنامج Windows Authentication ويتصل افتراضيًا بالخادم `localhost` وقاعدة `[Maintenance Contract]`. يمكن تغييرهما من متغيري البيئة `SQLSERVER_HOST` و`SQLSERVER_DATABASE`.
+غيّر كلمة المرور قبل الاستخدام الفعلي. يستخدم البرنامج Windows Authentication. عند التشغيل اليدوي يتصل افتراضيًا بالخادم `localhost`، بينما يستخدم `start.bat` الخادم `.\SQLEXPRESS` المناسب عادةً لـ SQL Server Express. قاعدة البيانات الافتراضية هي `[Maintenance Contract]`، ويمكن تغيير الإعدادات من متغيري البيئة `SQLSERVER_HOST` و`SQLSERVER_DATABASE`.

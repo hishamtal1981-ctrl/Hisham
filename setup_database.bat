@@ -1,14 +1,20 @@
 @echo off
 setlocal
-set "SQLCMD=C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\SQLCMD.EXE"
+if "%SQLSERVER_HOST%"=="" set "SQLSERVER_HOST=.\SQLEXPRESS"
 set "SCRIPT=%~dp0database_setup.sql"
-echo Creating tables in [Maintenance Contract] on AMMHLITM01...
-"%SQLCMD%" -S AMMHLITM01 -E -d "Maintenance Contract" -b -i "%SCRIPT%"
+where sqlcmd >nul 2>nul
+if errorlevel 1 (
+  echo sqlcmd was not found. Install SQL Server command-line utilities or run database_setup.sql in SSMS.
+  pause
+  exit /b 1
+)
+echo Creating [Maintenance Contract] and its tables on %SQLSERVER_HOST%...
+sqlcmd -S "%SQLSERVER_HOST%" -E -b -i "%SCRIPT%"
 if errorlevel 1 (
   echo DATABASE SETUP FAILED. Please copy the error shown above.
   pause
   exit /b 1
 )
 echo Database setup completed. Tables:
-"%SQLCMD%" -S AMMHLITM01 -E -d "Maintenance Contract" -Q "SET NOCOUNT ON; SELECT name FROM sys.tables ORDER BY name;"
+sqlcmd -S "%SQLSERVER_HOST%" -E -d "Maintenance Contract" -Q "SET NOCOUNT ON; SELECT name FROM sys.tables ORDER BY name;"
 pause
