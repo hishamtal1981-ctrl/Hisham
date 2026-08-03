@@ -71,15 +71,28 @@ function Get-Package([string[]]$Names) {
 }
 
 function Install-SqlExpress {
-    $installer = Get-Package @('SQL2022-SSEI-Expr.exe','SQL2022-Express.exe')
-    if (-not $installer) {
-        $installer = Join-Path $env:TEMP 'SQL2022-SSEI-Expr.exe'
-        Write-SetupLog 'Downloading SQL Server 2022 Express from Microsoft...'
-        Invoke-WebRequest 'https://go.microsoft.com/fwlink/?linkid=2216019' -OutFile $installer -UseBasicParsing
+    $fullMedia = Get-Package @('SQLEXPR_x64_ENU.exe','SQLEXPR_x64_2022.exe')
+    if (-not $fullMedia) {
+        $bootstrapper = Get-Package @('SQL2022-SSEI-Expr.exe')
+        if (-not $bootstrapper) {
+            $bootstrapper = Join-Path $env:TEMP 'SQL2022-SSEI-Expr.exe'
+            Write-SetupLog 'Downloading the version-specific SQL Server 2022 Express bootstrapper...'
+            Invoke-WebRequest 'https://download.microsoft.com/download/5/1/4/5145fe04-4d30-4b85-b0d1-39533663a2f1/SQL2022-SSEI-Expr.exe' -OutFile $bootstrapper -UseBasicParsing
+        }
+        $mediaPath = Join-Path $env:TEMP ("MaintenanceContract-SQLMedia-" + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $mediaPath -Force | Out-Null
+        Write-SetupLog 'Downloading the complete SQL Server 2022 Express media...'
+        $downloadArguments = '/ACTION=Download /MEDIATYPE=Core /MEDIAPATH="{0}" /QUIET' -f $mediaPath
+        $download = Start-Process $bootstrapper -ArgumentList $downloadArguments -Wait -PassThru
+        if ($download.ExitCode -notin @(0,3010)) { throw "SQL Server media download failed with exit code $($download.ExitCode)." }
+        $fullMedia = Get-ChildItem $mediaPath -Recurse -File -Filter 'SQLEXPR*.exe' |
+            Where-Object { $_.Name -notlike '*SSEI*' } |
+            Select-Object -First 1 -ExpandProperty FullName
+        if (-not $fullMedia) { throw 'SQL Server downloaded, but SQLEXPR_x64_ENU.exe was not found.' }
     }
-    Write-SetupLog 'Installing SQL Server Express instance MAINTENANCE...'
-    $arguments = '/ACTION=Install /FEATURES=SQLENGINE /INSTANCENAME=MAINTENANCE /SQLSVCSTARTUPTYPE=Automatic /ADDCURRENTUSERASSQLADMIN=True /IACCEPTSQLSERVERLICENSETERMS /Q'
-    $process = Start-Process $installer -ArgumentList $arguments -Wait -PassThru
+    Write-SetupLog "Installing SQL Server Express instance MAINTENANCE from $fullMedia..."
+    $arguments = '/Q /ACTION=Install /FEATURES=SQL /INSTANCENAME=MAINTENANCE /SQLSVCSTARTUPTYPE=Automatic /ADDCURRENTUSERASSQLADMIN=True /IACCEPTSQLSERVERLICENSETERMS /TCPENABLED=1 /NPENABLED=0'
+    $process = Start-Process $fullMedia -ArgumentList $arguments -Wait -PassThru
     if ($process.ExitCode -notin @(0,3010)) { throw "SQL Server setup failed with exit code $($process.ExitCode)." }
     Start-Service 'MSSQL$MAINTENANCE' -ErrorAction SilentlyContinue
     return '.\MAINTENANCE'

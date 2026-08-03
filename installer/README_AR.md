@@ -11,6 +11,6 @@
 
 ## التثبيت دون إنترنت
 
-ضع مثبتات Microsoft وPython الرسمية داخل `installer\packages`، وضع حزم Python داخل `installer\packages\wheels`. راجع ملف `packages\README.md` للأسماء المطلوبة.
+ضع وسائط SQL الكاملة باسم `SQLEXPR_x64_ENU.exe` ومثبتات Microsoft وPython الرسمية داخل `installer\packages`، وضع حزم Python داخل `installer\packages\wheels`. راجع ملف `packages\README.md` للأسماء المطلوبة.
 
 SQL Server Express مجاني ومتاح لإعادة التوزيع، لكن يجب على المستخدم الموافقة على شروط Microsoft داخل المعالج. لا تُرفع ملفات التثبيت الكبيرة إلى GitHub؛ يمكن إضافتها إلى نسخة Offline خارج المستودع.
