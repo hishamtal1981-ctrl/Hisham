@@ -197,17 +197,37 @@ $installButton.Add_Click({
 cd /d "$target"
 set "SQLSERVER_HOST=$sqlServer"
 set "SQLSERVER_DATABASE=$database"
-"$venvPython" -m uvicorn server:app --host 0.0.0.0 --port $port
+"$venvPython" -m uvicorn server:app --host 0.0.0.0 --port $port >> "$target\server.log" 2>&1
 "@
         Set-Content -Path (Join-Path $target 'run-server.cmd') -Value $runner -Encoding ASCII
         $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/c "{0}"' -f (Join-Path $target 'run-server.cmd')) -WorkingDirectory $target
-        $trigger = New-ScheduledTaskTrigger -AtStartup
-        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+        $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
         Register-ScheduledTask -TaskName 'Maintenance Contract Server' -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
         if (-not (Get-NetFirewallRule -DisplayName 'Maintenance Contract Web' -ErrorAction SilentlyContinue)) {
             New-NetFirewallRule -DisplayName 'Maintenance Contract Web' -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow | Out-Null
         }
         Start-ScheduledTask -TaskName 'Maintenance Contract Server'
+        $serverStarted = $false
+        foreach ($attempt in 1..20) {
+            Start-Sleep -Milliseconds 500
+            $client = [Net.Sockets.TcpClient]::new()
+            try {
+                $client.Connect('127.0.0.1',$port)
+                $serverStarted = $true
+                break
+            } catch {
+                # The server can take a few seconds to import modules and connect to SQL Server.
+            } finally {
+                $client.Dispose()
+            }
+        }
+        if (-not $serverStarted) {
+            $serverLog = Join-Path $target 'server.log'
+            $details = if (Test-Path $serverLog) { (Get-Content $serverLog -Tail 12) -join "`n" } else { 'No server log was created.' }
+            throw "The web server did not start. Log:`n$details"
+        }
         $config = @{sql_server=$sqlServer;database=$database;port=$port;installed_at=(Get-Date).ToString('o')} | ConvertTo-Json
         Set-Content -Path (Join-Path $target 'install-config.json') -Value $config -Encoding UTF8
         Write-SetupLog "Installation completed. Open http://$($env:COMPUTERNAME):$port"
