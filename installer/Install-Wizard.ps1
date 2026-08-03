@@ -216,8 +216,9 @@ $installButton.Add_Click({
             & $venvPython -m pip install --no-cache-dir -r (Join-Path $target 'requirements.txt')
         }
         if ($LASTEXITCODE -ne 0) { throw 'Python package installation failed.' }
-        & $venvPython -c 'import fastapi, uvicorn, pyodbc; print("Python packages verified.")' 2>&1 | ForEach-Object { Write-SetupLog ([string]$_) }
+        & $venvPython -c 'import fastapi,uvicorn,pyodbc' 2>&1 | ForEach-Object { Write-SetupLog ([string]$_) }
         if ($LASTEXITCODE -ne 0) { throw 'Python package verification failed after installation.' }
+        Write-SetupLog 'Python packages verified.'
         $env:SQLSERVER_HOST = $sqlServer
         $env:SQLSERVER_DATABASE = $database
         Write-SetupLog 'Creating database and application tables...'
