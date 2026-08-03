@@ -221,22 +221,26 @@ set "SQLSERVER_DATABASE=$database"
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
         $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
         Register-ScheduledTask -TaskName 'Maintenance Contract Server' -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
-        if (-not (Get-NetFirewallRule -DisplayName 'Maintenance Contract Web' -ErrorAction SilentlyContinue)) {
+        $firewallRule = Get-NetFirewallRule -DisplayName 'Maintenance Contract Web' -ErrorAction SilentlyContinue
+        if (-not $firewallRule) {
             New-NetFirewallRule -DisplayName 'Maintenance Contract Web' -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow | Out-Null
+        } else {
+            $firewallRule | Set-NetFirewallRule -Enabled True -Action Allow | Out-Null
+            $firewallRule | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter -Protocol TCP -LocalPort $port | Out-Null
         }
         Start-ScheduledTask -TaskName 'Maintenance Contract Server'
         $serverStarted = $false
-        foreach ($attempt in 1..20) {
+        $localUrl = "http://127.0.0.1:$port/"
+        foreach ($attempt in 1..30) {
             Start-Sleep -Milliseconds 500
-            $client = [Net.Sockets.TcpClient]::new()
             try {
-                $client.Connect('127.0.0.1',$port)
-                $serverStarted = $true
-                break
+                $response = Invoke-WebRequest -Uri $localUrl -UseBasicParsing -TimeoutSec 5
+                if ($response.StatusCode -eq 200) {
+                    $serverStarted = $true
+                    break
+                }
             } catch {
-                # The server can take a few seconds to import modules and connect to SQL Server.
-            } finally {
-                $client.Dispose()
+                # The application can take a few seconds to initialize and answer HTTP requests.
             }
         }
         if (-not $serverStarted) {
@@ -246,8 +250,11 @@ set "SQLSERVER_DATABASE=$database"
         }
         $config = @{sql_server=$sqlServer;database=$database;port=$port;installed_at=(Get-Date).ToString('o')} | ConvertTo-Json
         Set-Content -Path (Join-Path $target 'install-config.json') -Value $config -Encoding UTF8
-        Write-SetupLog "Installation completed. Open http://$($env:COMPUTERNAME):$port"
-        [Windows.Forms.MessageBox]::Show("تم التثبيت بنجاح.`nhttp://$($env:COMPUTERNAME):$port",'Maintenance Contract') | Out-Null
+        $networkUrl = "http://$($env:COMPUTERNAME):$port/"
+        Write-SetupLog "Installation completed. Local URL: $localUrl"
+        Write-SetupLog "Network URL: $networkUrl"
+        Start-Process $localUrl
+        [Windows.Forms.MessageBox]::Show("تم التثبيت وفتح البرنامج بنجاح.`nعلى هذا الجهاز: $localUrl`nمن أجهزة الشبكة: $networkUrl",'Maintenance Contract') | Out-Null
     } catch {
         Write-SetupLog "ERROR: $($_.Exception.Message)"
         [Windows.Forms.MessageBox]::Show($_.Exception.Message,'Setup failed','OK','Error') | Out-Null
