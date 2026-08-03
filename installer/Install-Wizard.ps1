@@ -174,6 +174,13 @@ $installButton.Add_Click({
         $database = $databaseBox.Text.Trim()
         $port = [int]$portBox.Value
         if (-not $target -or -not $database) { throw 'The installation folder and database name are required.' }
+        Write-SetupLog 'Stopping the existing application service before updating files...'
+        Stop-ScheduledTask -TaskName 'Maintenance Contract Server' -ErrorAction SilentlyContinue
+        $existingVenvPython = [IO.Path]::GetFullPath((Join-Path $target '.venv\Scripts\python.exe'))
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath,$existingVenvPython,[StringComparison]::OrdinalIgnoreCase) } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 2
         $sqlServer = Find-SqlServer
         if (-not $sqlServer) {
             if (-not $installSql.Checked) { $sqlServer = $serverBox.Text.Trim() }
@@ -188,13 +195,17 @@ $installButton.Add_Click({
         Ensure-OdbcDriver
         $python = Ensure-Python
         Write-SetupLog "Using Python: $python"
-        Write-SetupLog 'Creating or repairing Python environment...'
+        Write-SetupLog 'Preparing Python environment...'
         $venvPath = Join-Path $target '.venv'
-        & $python -m venv --clear $venvPath 2>&1 | ForEach-Object { Write-SetupLog ([string]$_) }
-        $venvExit = $LASTEXITCODE
         $venvPython = Join-Path $venvPath 'Scripts\python.exe'
-        if ($venvExit -ne 0 -or -not (Test-Path -LiteralPath $venvPython)) {
-            throw "Python environment creation failed (exit code $venvExit). Check antivirus permissions for $target."
+        if (Test-Path -LiteralPath $venvPython) {
+            Write-SetupLog 'Reusing the existing Python environment.'
+        } else {
+            & $python -m venv $venvPath 2>&1 | ForEach-Object { Write-SetupLog ([string]$_) }
+            $venvExit = $LASTEXITCODE
+            if ($venvExit -ne 0 -or -not (Test-Path -LiteralPath $venvPython)) {
+                throw "Python environment creation failed (exit code $venvExit). Check antivirus permissions for $target."
+            }
         }
         $wheelhouse = Join-Path $PSScriptRoot 'packages\wheels'
         if (Test-Path $wheelhouse) {
