@@ -21,7 +21,7 @@ if not driver:
 def connection_string(target_database: str) -> str:
     return (
         f"DRIVER={{{driver}}};SERVER={server};DATABASE={target_database};"
-        "Trusted_Connection=yes;Encrypt=Optional;TrustServerCertificate=yes;"
+        "Trusted_Connection=yes;Encrypt=no;TrustServerCertificate=yes;"
     )
 
 

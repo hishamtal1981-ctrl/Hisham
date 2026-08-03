@@ -67,7 +67,7 @@ def db():
     connection_string = (
         f"DRIVER={{{driver}}};"
         f"SERVER={DB_SERVER};DATABASE={DB_NAME};"
-        "Trusted_Connection=yes;Encrypt=Optional;TrustServerCertificate=yes;"
+        "Trusted_Connection=yes;Encrypt=no;TrustServerCertificate=yes;"
     )
     return SqlConnection(pyodbc.connect(connection_string))
 
