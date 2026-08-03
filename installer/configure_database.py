@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import pyodbc
 
@@ -24,7 +25,28 @@ def connection_string(target_database: str) -> str:
     )
 
 
-with pyodbc.connect(connection_string("master"), autocommit=True) as connection:
+def connect_with_retry(target_database: str, attempts: int = 60):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return pyodbc.connect(
+                connection_string(target_database), autocommit=True, timeout=5
+            )
+        except pyodbc.Error as error:
+            last_error = error
+            if attempt < attempts:
+                print(
+                    f"Waiting for SQL Server {server} ({attempt}/{attempts})...",
+                    flush=True,
+                )
+                time.sleep(2)
+    raise SystemExit(
+        f"Could not connect to SQL Server {server} after {attempts} attempts: "
+        f"{last_error}"
+    )
+
+
+with connect_with_retry("master") as connection:
     escaped_database = database.replace("]", "]]" )
     connection.execute(
         f"IF DB_ID(?) IS NULL EXEC('CREATE DATABASE [{escaped_database}]')", database
@@ -34,7 +56,7 @@ with pyodbc.connect(connection_string("master"), autocommit=True) as connection:
         "CREATE LOGIN [NT AUTHORITY\\SYSTEM] FROM WINDOWS"
     )
 
-with pyodbc.connect(connection_string(database), autocommit=True) as connection:
+with connect_with_retry(database) as connection:
     connection.execute(
         "IF USER_ID(N'NT AUTHORITY\\SYSTEM') IS NULL "
         "CREATE USER [NT AUTHORITY\\SYSTEM] FOR LOGIN [NT AUTHORITY\\SYSTEM]"
