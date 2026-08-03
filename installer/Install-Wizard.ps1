@@ -195,24 +195,25 @@ $installButton.Add_Click({
         Ensure-OdbcDriver
         $python = Ensure-Python
         Write-SetupLog "Using Python: $python"
-        Write-SetupLog 'Preparing Python environment...'
+        Write-SetupLog 'Creating a clean Python environment...'
         $venvPath = Join-Path $target '.venv'
+        if (Test-Path -LiteralPath $venvPath) {
+            $backupVenv = Join-Path $target ('.venv.previous-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            Write-SetupLog "Moving the previous Python environment to $backupVenv..."
+            Move-Item -LiteralPath $venvPath -Destination $backupVenv
+        }
+        & $python -m venv $venvPath 2>&1 | ForEach-Object { Write-SetupLog ([string]$_) }
+        $venvExit = $LASTEXITCODE
         $venvPython = Join-Path $venvPath 'Scripts\python.exe'
-        if (Test-Path -LiteralPath $venvPython) {
-            Write-SetupLog 'Reusing the existing Python environment.'
-        } else {
-            & $python -m venv $venvPath 2>&1 | ForEach-Object { Write-SetupLog ([string]$_) }
-            $venvExit = $LASTEXITCODE
-            if ($venvExit -ne 0 -or -not (Test-Path -LiteralPath $venvPython)) {
-                throw "Python environment creation failed (exit code $venvExit). Check antivirus permissions for $target."
-            }
+        if ($venvExit -ne 0 -or -not (Test-Path -LiteralPath $venvPython)) {
+            throw "Python environment creation failed (exit code $venvExit). Check antivirus permissions for $target."
         }
         $wheelhouse = Join-Path $PSScriptRoot 'packages\wheels'
-        Write-SetupLog 'Installing and repairing Python packages...'
+        Write-SetupLog 'Installing Python packages into the clean environment...'
         if (Test-Path $wheelhouse) {
-            & $venvPython -m pip install --upgrade --force-reinstall --no-index --find-links $wheelhouse -r (Join-Path $target 'requirements.txt')
+            & $venvPython -m pip install --no-index --find-links $wheelhouse -r (Join-Path $target 'requirements.txt')
         } else {
-            & $venvPython -m pip install --upgrade --force-reinstall --no-cache-dir -r (Join-Path $target 'requirements.txt')
+            & $venvPython -m pip install --no-cache-dir -r (Join-Path $target 'requirements.txt')
         }
         if ($LASTEXITCODE -ne 0) { throw 'Python package installation failed.' }
         & $venvPython -c 'import fastapi, uvicorn, pyodbc; print("Python packages verified.")' 2>&1 | ForEach-Object { Write-SetupLog ([string]$_) }
