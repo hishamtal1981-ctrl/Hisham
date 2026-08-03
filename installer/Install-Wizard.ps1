@@ -94,7 +94,10 @@ function Install-SqlExpress {
     $arguments = '/Q /ACTION=Install /FEATURES=SQL /INSTANCENAME=MAINTENANCE /SQLSVCSTARTUPTYPE=Automatic /ADDCURRENTUSERASSQLADMIN=True /IACCEPTSQLSERVERLICENSETERMS /TCPENABLED=1 /NPENABLED=0'
     $process = Start-Process $fullMedia -ArgumentList $arguments -Wait -PassThru
     if ($process.ExitCode -notin @(0,3010)) { throw "SQL Server setup failed with exit code $($process.ExitCode)." }
-    Start-Service 'MSSQL$MAINTENANCE' -ErrorAction SilentlyContinue
+    $sqlService = Get-Service 'MSSQL$MAINTENANCE' -ErrorAction Stop
+    if ($sqlService.Status -ne 'Running') { Start-Service $sqlService }
+    Write-SetupLog 'Waiting for SQL Server service to become ready...'
+    $sqlService.WaitForStatus('Running',[TimeSpan]::FromMinutes(2))
     return '.\MAINTENANCE'
 }
 
