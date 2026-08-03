@@ -103,12 +103,25 @@ function Ensure-OdbcDriver {
 }
 
 function Ensure-Python {
+    function Resolve-PythonExecutable([string]$Command, [string[]]$Arguments) {
+        try {
+            $candidate = & $Command @Arguments 2>$null
+            if ($LASTEXITCODE -eq 0 -and $candidate) {
+                $path = ([string]($candidate | Select-Object -First 1)).Trim()
+                if ($path -and (Test-Path -LiteralPath $path)) { return $path }
+            }
+        } catch { return $null }
+        return $null
+    }
+
     $python = $null
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        $candidate = & py -3.12 -c 'import sys; print(sys.executable)' 2>$null
-        if ($LASTEXITCODE -eq 0) { $python = $candidate }
+        $python = Resolve-PythonExecutable 'py' @('-3.12','-c','import sys; print(sys.executable)')
+        if (-not $python) { $python = Resolve-PythonExecutable 'py' @('-3','-c','import sys; print(sys.executable)') }
     }
-    if (-not $python -and (Get-Command python -ErrorAction SilentlyContinue)) { $python = (Get-Command python).Source }
+    if (-not $python -and (Get-Command python -ErrorAction SilentlyContinue)) {
+        $python = Resolve-PythonExecutable (Get-Command python).Source @('-c','import sys; print(sys.executable)')
+    }
     if ($python) { return $python }
     $installer = Get-Package @('python-3.12-amd64.exe','python-installer.exe')
     if (-not $installer) {
@@ -118,8 +131,20 @@ function Ensure-Python {
     }
     $process = Start-Process $installer -ArgumentList '/quiet InstallAllUsers=1 PrependPath=1 Include_test=0' -Wait -PassThru
     if ($process.ExitCode -ne 0) { throw "Python setup failed with exit code $($process.ExitCode)." }
-    $candidate = & "$env:SystemRoot\py.exe" -3.12 -c 'import sys; print(sys.executable)'
-    return $candidate
+    foreach ($candidate in @(
+        "$env:ProgramFiles\Python312\python.exe",
+        "$env:LocalAppData\Programs\Python\Python312\python.exe",
+        "$env:SystemRoot\py.exe"
+    )) {
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        if ($candidate -like '*\py.exe') {
+            $python = Resolve-PythonExecutable $candidate @('-3.12','-c','import sys; print(sys.executable)')
+        } else {
+            $python = Resolve-PythonExecutable $candidate @('-c','import sys; print(sys.executable)')
+        }
+        if ($python) { return $python }
+    }
+    throw 'Python was installed but its executable could not be located. Restart Windows and run the wizard again.'
 }
 
 $detected = Find-SqlServer
@@ -146,9 +171,15 @@ $installButton.Add_Click({
         }
         Ensure-OdbcDriver
         $python = Ensure-Python
-        Write-SetupLog 'Creating Python environment...'
-        & $python -m venv (Join-Path $target '.venv')
-        $venvPython = Join-Path $target '.venv\Scripts\python.exe'
+        Write-SetupLog "Using Python: $python"
+        Write-SetupLog 'Creating or repairing Python environment...'
+        $venvPath = Join-Path $target '.venv'
+        & $python -m venv --clear $venvPath 2>&1 | ForEach-Object { Write-SetupLog ([string]$_) }
+        $venvExit = $LASTEXITCODE
+        $venvPython = Join-Path $venvPath 'Scripts\python.exe'
+        if ($venvExit -ne 0 -or -not (Test-Path -LiteralPath $venvPython)) {
+            throw "Python environment creation failed (exit code $venvExit). Check antivirus permissions for $target."
+        }
         $wheelhouse = Join-Path $PSScriptRoot 'packages\wheels'
         if (Test-Path $wheelhouse) {
             & $venvPython -m pip install --no-index --find-links $wheelhouse -r (Join-Path $target 'requirements.txt')
