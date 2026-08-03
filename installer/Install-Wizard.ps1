@@ -250,11 +250,17 @@ set "SQLSERVER_DATABASE=$database"
         }
         $config = @{sql_server=$sqlServer;database=$database;port=$port;installed_at=(Get-Date).ToString('o')} | ConvertTo-Json
         Set-Content -Path (Join-Path $target 'install-config.json') -Value $config -Encoding UTF8
-        $networkUrl = "http://$($env:COMPUTERNAME):$port/"
+        $networkAddress = Get-NetIPConfiguration |
+            Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' -and $_.IPv4Address } |
+            Select-Object -First 1 -ExpandProperty IPv4Address |
+            Select-Object -ExpandProperty IPAddress
+        $networkUrl = if ($networkAddress) { "http://${networkAddress}:$port/" } else { "http://$($env:COMPUTERNAME):$port/" }
+        $computerUrl = "http://$($env:COMPUTERNAME):$port/"
         Write-SetupLog "Installation completed. Local URL: $localUrl"
-        Write-SetupLog "Network URL: $networkUrl"
+        Write-SetupLog "Network IP URL: $networkUrl"
+        Write-SetupLog "Computer name URL: $computerUrl"
         Start-Process $localUrl
-        [Windows.Forms.MessageBox]::Show("تم التثبيت وفتح البرنامج بنجاح.`nعلى هذا الجهاز: $localUrl`nمن أجهزة الشبكة: $networkUrl",'Maintenance Contract') | Out-Null
+        [Windows.Forms.MessageBox]::Show("تم التثبيت وفتح البرنامج بنجاح.`nعلى هذا الجهاز: $localUrl`nمن أجهزة الشبكة: $networkUrl`nباسم الجهاز: $computerUrl",'Maintenance Contract') | Out-Null
     } catch {
         Write-SetupLog "ERROR: $($_.Exception.Message)"
         [Windows.Forms.MessageBox]::Show($_.Exception.Message,'Setup failed','OK','Error') | Out-Null
