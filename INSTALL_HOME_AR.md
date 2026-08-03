@@ -10,15 +10,14 @@
 ## إعداد قاعدة البيانات
 
 1. افتح SSMS واتصل بخادم SQL Server الموجود على كمبيوتر المنزل.
-2. أنشئ قاعدة بيانات جديدة باسم `Maintenance Contract`.
-3. افتح الملف `database_setup.sql` داخل SSMS.
-4. تأكد أن قاعدة البيانات المحددة هي `Maintenance Contract` ثم اضغط Execute أو F5.
-5. حدّث مجلد Tables؛ يجب أن تظهر الجداول: `contracts`, `groups_tbl`, `properties`, `users`.
+2. انقر مرتين على `setup_database.bat`؛ سيُنشئ قاعدة البيانات والجداول تلقائيًا.
+3. إذا لم يكن `sqlcmd` مثبتًا، افتح الملف `database_setup.sql` داخل SSMS واضغط Execute أو F5.
+4. حدّث مجلد Tables؛ يجب أن تظهر الجداول: `contracts`, `groups_tbl`, `properties`, `users`.
 
 ## تشغيل البرنامج
 
 1. فك ضغط الحزمة في مجلد ثابت، مثل `C:\MaintenanceContract`.
-2. انقر مرتين على `start.bat` واترك النافذة مفتوحة.
+2. انقر مرتين على `start.bat` واترك النافذة مفتوحة. في أول تشغيل سيُنشئ بيئة Python ويثبت المتطلبات تلقائيًا.
 3. افتح `http://localhost:8000`.
 
 بيانات الدخول الابتدائية:

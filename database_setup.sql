@@ -1,3 +1,8 @@
+IF DB_ID(N'Maintenance Contract') IS NULL
+BEGIN
+    CREATE DATABASE [Maintenance Contract];
+END;
+GO
 USE [Maintenance Contract];
 GO
 IF OBJECT_ID('dbo.properties','U') IS NULL CREATE TABLE dbo.properties(id INT IDENTITY(1,1) PRIMARY KEY,name NVARCHAR(200) UNIQUE NOT NULL,logo NVARCHAR(1000) NOT NULL DEFAULT '',active BIT NOT NULL DEFAULT 0);

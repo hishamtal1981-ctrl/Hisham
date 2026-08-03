@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 ROOT = Path(__file__).resolve().parent
 DB_NAME = os.getenv("SQLSERVER_DATABASE", "Maintenance Contract")
@@ -38,6 +38,10 @@ class SqlCursor:
         for row in self.cursor:
             yield dict(zip(columns, row))
 
+    @property
+    def rowcount(self):
+        return self.cursor.rowcount
+
 
 class SqlConnection:
     def __init__(self, connection):
@@ -56,8 +60,12 @@ class SqlConnection:
 
 def db():
     import pyodbc
+    installed = set(pyodbc.drivers())
+    driver = next((name for name in ('ODBC Driver 18 for SQL Server', 'ODBC Driver 17 for SQL Server') if name in installed), None)
+    if not driver:
+        raise RuntimeError('Install Microsoft ODBC Driver 18 or 17 for SQL Server')
     connection_string = (
-        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"DRIVER={{{driver}}};"
         f"SERVER={DB_SERVER};DATABASE={DB_NAME};"
         "Trusted_Connection=yes;Encrypt=Optional;TrustServerCertificate=yes;"
     )
@@ -131,6 +139,28 @@ class Contract(BaseModel):
     property_name: str = ''
     notes: str = ''
 
+    @field_validator('name', 'contractor_name')
+    @classmethod
+    def required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError('This field is required')
+        return value
+
+    @field_validator('value', 'tax_percent')
+    @classmethod
+    def non_negative_number(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError('Value cannot be negative')
+        return value
+
+    @field_validator('start_date', 'end_date')
+    @classmethod
+    def valid_date(cls, value: str) -> str:
+        if value:
+            date.fromisoformat(value)
+        return value
+
 
 class UserPayload(BaseModel):
     username: str
@@ -161,6 +191,13 @@ def login(payload: Login):
     selected_name = payload.property_name if selected_property else ''
     SESSIONS[token] = {'username': row['username'], 'property_name': selected_name}
     return {'token': token, 'user': {'username': row['username'], 'role': row['role'], 'property_name': selected_name}}
+
+
+@app.post('/api/auth/logout')
+def logout(authorization: str | None = Header(None)):
+    token = (authorization or '').removeprefix('Bearer ').strip()
+    SESSIONS.pop(token, None)
+    return {'success': True}
 
 
 @app.get('/api/auth/properties')
@@ -220,17 +257,36 @@ def add_contract(payload: Contract, authorization: str | None = Header(None)):
     return {'success':True,'id':contract_id,'property_name':data['property_name']}
 
 
+def contract_access(user: dict[str, Any], contract_id: int) -> dict[str, Any]:
+    with db() as con:
+        contract = con.execute('SELECT id,property_name FROM contracts WHERE id=?',(contract_id,)).fetchone()
+    if not contract:
+        raise HTTPException(404, 'Contract not found')
+    if user['property_name'] and contract['property_name'] != user['property_name']:
+        raise HTTPException(403, 'You cannot modify a contract from another property')
+    return contract
+
+
 @app.put('/api/contracts/{contract_id}')
 def edit_contract(contract_id: int, payload: Contract, authorization: str | None = Header(None)):
-    auth(authorization); data=payload.model_dump(); now=datetime.now(timezone.utc).isoformat()
+    user=auth(authorization); contract_access(user,contract_id); data=payload.model_dump(); now=datetime.now(timezone.utc).isoformat()
+    if user['property_name']:
+        data['property_name']=user['property_name']
+    if not data['property_name']:
+        raise HTTPException(400, 'Please select a property for this contract')
     with db() as con:
-        con.execute('''UPDATE contracts SET name=?,contractor_name=?,contractor_phone=?,department=?,value=?,currency=?,tax_percent=?,start_date=?,end_date=?,property_name=?,notes=?,updated_at=? WHERE id=?''',(*data.values(),now,contract_id))
+        if not con.execute('SELECT id FROM properties WHERE name=?',(data['property_name'],)).fetchone():
+            raise HTTPException(400, 'The selected property does not exist')
+    data['start_date']=data['start_date'] or None; data['end_date']=data['end_date'] or None
+    with db() as con:
+        con.execute('''UPDATE contracts SET name=?,contractor_name=?,contractor_phone=?,department=?,value=?,currency=?,tax_percent=?,start_date=?,end_date=?,property_name=?,notes=?,updated_at=? WHERE id=?''',(
+            data['name'],data['contractor_name'],data['contractor_phone'],data['department'],data['value'],data['currency'],data['tax_percent'],data['start_date'],data['end_date'],data['property_name'],data['notes'],now,contract_id))
     return {'success':True}
 
 
 @app.delete('/api/contracts/{contract_id}')
 def archive_contract(contract_id:int, authorization: str | None = Header(None)):
-    auth(authorization)
+    user=auth(authorization); contract_access(user,contract_id)
     with db() as con: con.execute('UPDATE contracts SET archived=1 WHERE id=?',(contract_id,))
     return {'success':True}
 
