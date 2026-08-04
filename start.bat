@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 if "%SQLSERVER_HOST%"=="" (
-  set "SQLSERVER_HOST=.\SQLEXPRESS"
+  set "SQLSERVER_HOST=localhost"
 )
 if "%SQLSERVER_DATABASE%"=="" set "SQLSERVER_DATABASE=Maintenance Contract"
 if not exist ".venv\Scripts\python.exe" (
