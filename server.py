@@ -412,17 +412,86 @@ def first_document_value(text: str, labels: list[str]) -> str:
 
 
 def normalize_document_date(value: str) -> str:
-    match=re.search(r'(\d{1,4})[./\-](\d{1,2})[./\-](\d{1,4})',value or '')
-    if not match:
-        return ''
-    a,b,c=map(int,match.groups()); year,month,day=((a,b,c) if a>1900 else (c,b,a))
-    try:
-        return date(year,month,day).isoformat()
-    except ValueError:
-        return ''
+    value=(value or '').translate(str.maketrans('٠١٢٣٤٥٦٧٨٩','0123456789'))
+    match=re.search(r'(\d{1,4})[./\-](\d{1,2})[./\-](\d{1,4})',value)
+    if match:
+        a,b,c=map(int,match.groups()); year,month,day=((a,b,c) if a>1900 else (c,b,a))
+        try:
+            return date(year,month,day).isoformat()
+        except ValueError:
+            pass
+    month_date=re.search(r'([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?[,]?\s+(\d{4})|(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)[,]?\s+(\d{4})',value,re.IGNORECASE)
+    if month_date:
+        candidate=' '.join(x for x in month_date.groups() if x)
+        for pattern in ('%B %d %Y','%b %d %Y','%d %B %Y','%d %b %Y'):
+            try:
+                return datetime.strptime(candidate,pattern).date().isoformat()
+            except ValueError:
+                continue
+    return ''
+
+
+def labelled_document_date(text: str, labels: list[str]) -> str:
+    for label in labels:
+        match=re.search(label,text,re.IGNORECASE)
+        if match:
+            parsed=normalize_document_date(text[match.end():match.end()+160])
+            if parsed:
+                return parsed
+    return ''
+
+
+def document_dates(text: str) -> list[str]:
+    candidates=re.findall(r'\d{1,4}[./\-]\d{1,2}[./\-]\d{1,4}|(?:[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{4})|(?:\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+[,]?\s+\d{4})',text,re.IGNORECASE)
+    result=[]
+    for candidate in candidates:
+        parsed=normalize_document_date(candidate)
+        if parsed and parsed not in result:
+            result.append(parsed)
+    return result
+
+
+def document_company_phone(text: str) -> str:
+    labels=[r'(?:company|contractor|supplier|vendor)?\s*(?:phone|telephone|mobile)(?:\s*(?:number|no\.))?', '\u0631\u0642\u0645[ \t\r\n]*\u0647\u0627\u062a\u0641', '\u0627\u0644\u0647\u0627\u062a\u0641', '\u062c\u0648\u0627\u0644']
+    areas=[]
+    for label in labels:
+        match=re.search(label,text,re.IGNORECASE)
+        if match:
+            areas.append(text[match.end():match.end()+90])
+    areas.append(text)
+    for area in areas:
+        for match in re.finditer(r'(?<!\d)(?:\+?\d[\d\s().\-]{5,}\d)(?!\d)',area):
+            phone=re.sub(r'\s+',' ',match.group(0)).strip(' .-')
+            digits=re.sub(r'\D','',phone)
+            if 7<=len(digits)<=15 and not re.fullmatch(r'\d{1,4}[./\-]\d{1,2}[./\-]\d{1,4}',phone):
+                return phone
+    return ''
 
 
 @app.post('/api/contracts/extract-document')
+async def extract_contract_document_enhanced(file: UploadFile = File(...), authorization: str | None = Header(None)):
+    auth(authorization)
+    data=await file.read(MAX_ATTACHMENT_SIZE+1)
+    if not data or len(data)>MAX_ATTACHMENT_SIZE:
+        raise HTTPException(400,'Select a contract document between 1 byte and 25 MB')
+    text=contract_document_text(Path(file.filename or 'contract').name,file.content_type or '',data)
+    compact=re.sub(r'[ \t]+',' ',text)
+    start_date=labelled_document_date(compact,[r'contract\s+start\s+date',r'start\s+date',r'effective\s+date','\u062a\u0627\u0631\u064a\u062e[ \t\r\n]*(?:\u0628\u062f\u0621|\u0627\u0644\u0628\u062f\u0627\u064a\u0629)'])
+    end_date=labelled_document_date(compact,[r'contract\s+end\s+date',r'end\s+date',r'expir(?:y|ation)\s+date','\u062a\u0627\u0631\u064a\u062e[ \t\r\n]*(?:\u0627\u0646\u062a\u0647\u0627\u0621|\u0627\u0644\u0646\u0647\u0627\u064a\u0629)'])
+    dates=document_dates(compact)
+    if not start_date and dates: start_date=dates[0]
+    if not end_date and len(dates)>1: end_date=dates[1]
+    value_raw=first_document_value(compact,[r'contract value',r'total amount','\u0642\u064a\u0645\u0629[ \t\r\n]*\u0627\u0644\u0639\u0642\u062f'])
+    tax_raw=first_document_value(compact,[r'tax(?: percentage)?',r'vat','\u0627\u0644\u0636\u0631\u064a\u0628\u0629'])
+    currency_match=re.search(r'\b(JOD|JD|USD|EUR|SAR|AED|QAR|BHD|KWD|OMR|GBP)\b',compact,re.IGNORECASE)
+    number_match=re.search(r'[-+]?\d[\d,]*(?:\.\d+)?',value_raw)
+    tax_match=re.search(r'\d+(?:\.\d+)?',tax_raw)
+    result={'name':first_document_value(compact,[r'contract (?:name|title|subject)',r'agreement (?:name|title)','\u0627\u0633\u0645[ \t\r\n]*\u0627\u0644\u0639\u0642\u062f','\u0645\u0648\u0636\u0648\u0639[ \t\r\n]*\u0627\u0644\u0639\u0642\u062f']),'contractor_name':first_document_value(compact,[r'contractor(?: name)?',r'supplier(?: name)?',r'vendor(?: name)?','\u0627\u0633\u0645[ \t\r\n]*\u0627\u0644\u0645\u0642\u0627\u0648\u0644','\u0627\u0633\u0645[ \t\r\n]*\u0627\u0644\u0645\u0648\u0631\u062f']),'contractor_phone':document_company_phone(compact),'value':float(number_match.group(0).replace(',','')) if number_match else None,'currency':currency_match.group(1).upper() if currency_match else '','tax_percent':float(tax_match.group(0)) if tax_match else None,'start_date':start_date,'end_date':end_date,'notes':first_document_value(compact,[r'(?:scope of work|description|notes)','\u0646\u0637\u0627\u0642[ \t\r\n]*\u0627\u0644\u0639\u0645\u0644','\u0645\u0644\u0627\u062d\u0638\u0627\u062a'])}
+    result['extracted_fields']=[key for key,value in result.items() if value not in ('',None)]
+    return result
+
+
+@app.post('/api/contracts/extract-document-legacy',include_in_schema=False)
 async def extract_contract_document(file: UploadFile = File(...), authorization: str | None = Header(None)):
     auth(authorization)
     data=await file.read(MAX_ATTACHMENT_SIZE+1)
