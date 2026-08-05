@@ -8,6 +8,7 @@ import json
 import secrets
 import os
 import re
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from decimal import Decimal
@@ -24,7 +25,8 @@ from pydantic import BaseModel, field_validator
 ROOT = Path(__file__).resolve().parent
 DB_NAME = os.getenv("SQLSERVER_DATABASE", "Maintenance Contract")
 DB_SERVER = os.getenv("SQLSERVER_HOST", "localhost")
-SESSIONS: dict[str, dict[str, str]] = {}
+SESSION_IDLE_SECONDS = 5 * 60
+SESSIONS: dict[str, dict[str, Any]] = {}
 
 
 class SqlCursor:
@@ -75,7 +77,17 @@ def db():
         f"SERVER={DB_SERVER};DATABASE={DB_NAME};"
         "Trusted_Connection=yes;Encrypt=no;TrustServerCertificate=yes;"
     )
-    return SqlConnection(pyodbc.connect(connection_string))
+    last_error = None
+    for attempt in range(1, 13):
+        try:
+            return SqlConnection(pyodbc.connect(connection_string, timeout=8))
+        except pyodbc.Error as error:
+            last_error = error
+            if attempt < 12:
+                time.sleep(5)
+    raise RuntimeError(
+        f"Could not connect to SQL Server {DB_SERVER} after 12 attempts: {last_error}"
+    ) from last_error
 
 
 def password_hash(value: str) -> str:
@@ -94,6 +106,20 @@ def init_db() -> None:
           id INT IDENTITY(1,1) PRIMARY KEY, username NVARCHAR(200) UNIQUE NOT NULL,
           password_hash NVARCHAR(64) NOT NULL, role NVARCHAR(30) NOT NULL DEFAULT 'user',
           group_name NVARCHAR(200) NOT NULL DEFAULT '', property_name NVARCHAR(200) NOT NULL DEFAULT '')""")
+        for column, definition in (
+            ('all_properties', 'BIT NOT NULL DEFAULT 0'),
+            ('can_view', 'BIT NOT NULL DEFAULT 1'),
+            ('can_create', 'BIT NOT NULL DEFAULT 0'),
+            ('can_edit', 'BIT NOT NULL DEFAULT 0'),
+            ('can_archive', 'BIT NOT NULL DEFAULT 0'),
+            ('can_restore', 'BIT NOT NULL DEFAULT 0'),
+            ('can_delete', 'BIT NOT NULL DEFAULT 0'),
+            ('can_manage_users', 'BIT NOT NULL DEFAULT 0'),
+        ):
+            con.execute(f"IF COL_LENGTH('users','{column}') IS NULL ALTER TABLE users ADD {column} {definition}")
+        con.execute("""IF OBJECT_ID('user_properties','U') IS NULL CREATE TABLE user_properties(
+          user_id INT NOT NULL, property_name NVARCHAR(200) NOT NULL,
+          CONSTRAINT PK_user_properties PRIMARY KEY(user_id,property_name))""")
         con.execute("""IF OBJECT_ID('contracts','U') IS NULL CREATE TABLE contracts(
           id INT IDENTITY(1,1) PRIMARY KEY, name NVARCHAR(500) NOT NULL,
           contractor_name NVARCHAR(500) NOT NULL, contractor_phone NVARCHAR(100) NOT NULL DEFAULT '',
@@ -108,6 +134,9 @@ def init_db() -> None:
         con.execute("IF COL_LENGTH('contracts','attachment_size') IS NULL ALTER TABLE contracts ADD attachment_size BIGINT NULL")
         con.execute("IF COL_LENGTH('contracts','archived_at') IS NULL ALTER TABLE contracts ADD archived_at DATETIMEOFFSET NULL")
         con.execute("IF COL_LENGTH('contracts','archive_exempt') IS NULL ALTER TABLE contracts ADD archive_exempt BIT NOT NULL DEFAULT 0")
+        con.execute("IF COL_LENGTH('contracts','created_by') IS NULL ALTER TABLE contracts ADD created_by NVARCHAR(200) NOT NULL DEFAULT 'system'")
+        con.execute("IF COL_LENGTH('contracts','updated_by') IS NULL ALTER TABLE contracts ADD updated_by NVARCHAR(200) NOT NULL DEFAULT 'system'")
+        con.execute("IF COL_LENGTH('contracts','archived_by') IS NULL ALTER TABLE contracts ADD archived_by NVARCHAR(200) NULL")
         con.execute("UPDATE contracts SET archived_at=COALESCE(updated_at,created_at) WHERE archived=1 AND archived_at IS NULL")
         con.execute("""IF OBJECT_ID('audit_logs','U') IS NULL CREATE TABLE audit_logs(
           id INT IDENTITY(1,1) PRIMARY KEY, username NVARCHAR(200) NOT NULL,
@@ -139,6 +168,18 @@ def init_db() -> None:
         con.execute("""IF OBJECT_ID('database_backup_chunks','U') IS NULL CREATE TABLE database_backup_chunks(
           id INT IDENTITY(1,1) PRIMARY KEY, backup_id INT NOT NULL,
           chunk_index INT NOT NULL, chunk_data VARBINARY(MAX) NOT NULL)""")
+        con.execute("""IF OBJECT_ID('schema_migrations','U') IS NULL CREATE TABLE schema_migrations(
+          version INT PRIMARY KEY, description NVARCHAR(500) NOT NULL,
+          applied_at DATETIMEOFFSET NOT NULL)""")
+        con.execute("DELETE c FROM database_backup_chunks c LEFT JOIN database_backups b ON b.id=c.backup_id WHERE b.id IS NULL")
+        con.execute("WITH duplicate_chunks AS (SELECT id,ROW_NUMBER() OVER(PARTITION BY backup_id,chunk_index ORDER BY id) AS row_number FROM database_backup_chunks) DELETE FROM duplicate_chunks WHERE row_number>1")
+        con.execute("IF NOT EXISTS(SELECT 1 FROM sys.foreign_keys WHERE name='FK_database_backup_chunks_backup') ALTER TABLE database_backup_chunks ADD CONSTRAINT FK_database_backup_chunks_backup FOREIGN KEY(backup_id) REFERENCES database_backups(id) ON DELETE CASCADE")
+        con.execute("IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE name='UX_database_backup_chunks_order' AND object_id=OBJECT_ID('database_backup_chunks')) CREATE UNIQUE INDEX UX_database_backup_chunks_order ON database_backup_chunks(backup_id,chunk_index)")
+        con.execute("IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE name='IX_contracts_scope_status' AND object_id=OBJECT_ID('contracts')) CREATE INDEX IX_contracts_scope_status ON contracts(property_name,archived,end_date) INCLUDE(name,department,value,currency)")
+        con.execute("IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE name='IX_audit_logs_created' AND object_id=OBJECT_ID('audit_logs')) CREATE INDEX IX_audit_logs_created ON audit_logs(created_at DESC,property_name)")
+        con.execute("IF NOT EXISTS(SELECT 1 FROM sys.foreign_keys WHERE name='FK_user_properties_user') ALTER TABLE user_properties ADD CONSTRAINT FK_user_properties_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE")
+        con.execute("IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE name='IX_user_properties_property' AND object_id=OBJECT_ID('user_properties')) CREATE INDEX IX_user_properties_property ON user_properties(property_name,user_id)")
+        con.execute("IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE name='IX_database_backups_created' AND object_id=OBJECT_ID('database_backups')) CREATE INDEX IX_database_backups_created ON database_backups(created_at DESC)")
         default_backup_directory=str((ROOT/'backups').resolve()); now_setting=datetime.now(timezone.utc).isoformat()
         con.execute("IF NOT EXISTS(SELECT 1 FROM system_settings WHERE setting_key='backup_directory') INSERT INTO system_settings(setting_key,setting_value,updated_at) VALUES('backup_directory',?,?)",(default_backup_directory,now_setting))
         now = datetime.now(timezone.utc).isoformat()
@@ -150,10 +191,23 @@ def init_db() -> None:
         con.execute("IF COL_LENGTH('contracts','currency_code') IS NULL ALTER TABLE contracts ADD currency_code NVARCHAR(20) NULL")
         con.execute("UPDATE c SET department_id=d.id FROM contracts c JOIN departments d ON d.name=c.department WHERE c.department_id IS NULL")
         con.execute("UPDATE contracts SET currency_code=currency WHERE currency_code IS NULL AND currency<>''")
+        con.execute("IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE name='IX_contracts_department' AND object_id=OBJECT_ID('contracts')) CREATE INDEX IX_contracts_department ON contracts(department_id,currency_code)")
+        con.execute("""EXEC(N'CREATE OR ALTER VIEW dbo.vw_contract_management AS
+          SELECT c.id,c.name,c.contractor_name,c.contractor_phone,c.department,c.value,c.currency,
+          c.tax_percent,c.start_date,c.end_date,c.property_name,c.archived,c.archived_at,
+          CASE WHEN c.attachment_data IS NULL THEN CAST(0 AS BIT) ELSE CAST(1 AS BIT) END AS has_attachment,
+          CASE WHEN c.end_date IS NULL THEN N''active'' WHEN c.end_date<CAST(GETDATE() AS DATE) THEN N''expired''
+               WHEN c.end_date<=DATEADD(DAY,30,CAST(GETDATE() AS DATE)) THEN N''expiring_soon'' ELSE N''active'' END AS contract_status,
+          c.created_at,c.updated_at FROM dbo.contracts c')""")
+        con.execute("IF NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version=1) INSERT INTO schema_migrations(version,description,applied_at) VALUES(1,'Complete SQL persistence schema',?)",(now,))
         con.execute("IF NOT EXISTS(SELECT 1 FROM properties WHERE name=?) INSERT INTO properties(name,active) VALUES(?,1)", ('Hilton Amman','Hilton Amman'))
         con.execute("IF NOT EXISTS(SELECT 1 FROM groups_tbl WHERE name=?) INSERT INTO groups_tbl(name,description) VALUES(?,?)", ('Administrators','Administrators','System administrators'))
         con.execute("IF NOT EXISTS(SELECT 1 FROM users WHERE username=?) INSERT INTO users(username,password_hash,role,group_name,property_name) VALUES(?,?,?,?,?)",
                     ('admin','admin', password_hash('Admin@123'), 'admin', 'Administrators', 'Hilton Amman'))
+        if not con.execute("SELECT version FROM schema_migrations WHERE version=2").fetchone():
+            con.execute("UPDATE users SET all_properties=1,can_view=1,can_create=1,can_edit=1,can_archive=1,can_restore=1,can_delete=1,can_manage_users=1 WHERE role='admin'")
+            con.execute("INSERT INTO user_properties(user_id,property_name) SELECT id,property_name FROM users u WHERE property_name<>'' AND NOT EXISTS(SELECT 1 FROM user_properties up WHERE up.user_id=u.id AND up.property_name=u.property_name)")
+            con.execute("INSERT INTO schema_migrations(version,description,applied_at) VALUES(2,'Role permissions, multiple properties, and contract ownership audit',?)",(now,))
 
 
 init_db()
@@ -163,15 +217,29 @@ app = FastAPI(title="Maintenance Contracts System")
 def auth(authorization: str | None) -> dict[str, Any]:
     token = (authorization or '').removeprefix('Bearer ').strip()
     session = SESSIONS.get(token)
+    now = time.monotonic()
+    if session and now - float(session.get('last_activity', now)) >= SESSION_IDLE_SECONDS:
+        SESSIONS.pop(token, None)
+        session = None
     if not session:
         raise HTTPException(401, 'Unauthorized')
+    session['last_activity'] = now
     with db() as con:
-        user = con.execute('SELECT id,username,role,group_name,property_name FROM users WHERE username=?',(session['username'],)).fetchone()
+        user = con.execute('''SELECT id,username,role,group_name,property_name,all_properties,
+            can_view,can_create,can_edit,can_archive,can_restore,can_delete,can_manage_users
+            FROM users WHERE username=?''',(session['username'],)).fetchone()
     if not user:
         raise HTTPException(401, 'Unauthorized')
     result = dict(user)
     result['property_name'] = session['property_name']
+    with db() as con:
+        result['property_names'] = [x['property_name'] for x in con.execute('SELECT property_name FROM user_properties WHERE user_id=? ORDER BY property_name',(result['id'],))]
     return result
+
+
+def require_permission(user: dict[str, Any], permission: str) -> None:
+    if not bool(user.get(permission)):
+        raise HTTPException(403, 'You do not have permission to perform this action')
 
 
 def write_audit(user: dict[str, Any], action: str, entity_type: str, entity_id: int | None = None, details: str = '', property_name: str = '') -> None:
@@ -228,6 +296,15 @@ class UserPayload(BaseModel):
     role: str = 'user'
     group_name: str = ''
     property_name: str = ''
+    property_names: list[str] = []
+    all_properties: bool = False
+    can_view: bool = True
+    can_create: bool = False
+    can_edit: bool = False
+    can_archive: bool = False
+    can_restore: bool = False
+    can_delete: bool = False
+    can_manage_users: bool = False
 
 
 class NamedPayload(BaseModel):
@@ -258,15 +335,17 @@ def login(payload: Login):
     with db() as con:
         row = con.execute('SELECT * FROM users WHERE username=?',(payload.username,)).fetchone()
         selected_property = con.execute('SELECT name FROM properties WHERE name=?',(payload.property_name,)).fetchone() if payload.property_name else None
+        assigned = con.execute('SELECT 1 AS ok FROM user_properties WHERE user_id=? AND property_name=?',(row['id'],payload.property_name)).fetchone() if row and payload.property_name else None
     if not row or row['password_hash'] != password_hash(payload.password):
         raise HTTPException(401, 'Invalid username or password')
-    if row['role'] != 'admin' and not selected_property:
+    if not row['all_properties'] and not selected_property:
         raise HTTPException(400, 'Please select a valid property')
-    if row['role'] != 'admin' and row['property_name'] and row['property_name'] != payload.property_name:
+    if not row['all_properties'] and not assigned:
         raise HTTPException(403, 'This user is not assigned to the selected property')
     token = secrets.token_urlsafe(32)
     selected_name = payload.property_name if selected_property else ''
-    SESSIONS[token] = {'username': row['username'], 'property_name': selected_name}
+    SESSIONS[token] = {'username': row['username'], 'property_name': selected_name, 'last_activity': time.monotonic()}
+    write_audit(dict(row),'login','session',None,'Successful login',selected_name)
     return {'token': token, 'user': {'username': row['username'], 'role': row['role'], 'property_name': selected_name}}
 
 
@@ -300,7 +379,7 @@ def archive_expired_contracts() -> None:
     """Archive contracts after their final valid day has passed."""
     with db() as con:
         con.execute('''UPDATE contracts
-            SET archived=1, archived_at=?, updated_at=?
+            SET archived=1, archived_at=?, archived_by='system', updated_at=?, updated_by='system'
             WHERE archived=0 AND archive_exempt=0 AND end_date IS NOT NULL AND end_date < ?''',
             (datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), date.today().isoformat()))
 
@@ -308,6 +387,7 @@ def archive_expired_contracts() -> None:
 @app.get('/api/contracts')
 def list_contracts(include_archived: bool = False, authorization: str | None = Header(None)):
     user = auth(authorization)
+    require_permission(user, 'can_view')
     archive_expired_contracts()
     sql, args = '''SELECT id,name,contractor_name,contractor_phone,department,value,currency,
         tax_percent,start_date,end_date,property_name,notes,archived,
@@ -315,7 +395,8 @@ def list_contracts(include_archived: bool = False, authorization: str | None = H
         attachment_name,attachment_content_type,attachment_size,
         CASE WHEN attachment_data IS NULL THEN CAST(0 AS BIT) ELSE CAST(1 AS BIT) END AS has_attachment,
         CONVERT(NVARCHAR(40),created_at,127) AS created_at,
-        CONVERT(NVARCHAR(40),updated_at,127) AS updated_at
+        CONVERT(NVARCHAR(40),updated_at,127) AS updated_at,
+        created_by,updated_by,archived_by
         FROM contracts WHERE archived=?''', [1 if include_archived else 0]
     if user['property_name']:
         sql += ' AND property_name=?'; args.append(user['property_name'])
@@ -328,6 +409,7 @@ def list_contracts(include_archived: bool = False, authorization: str | None = H
 @app.post('/api/contracts')
 def add_contract(payload: Contract, authorization: str | None = Header(None)):
     user = auth(authorization)
+    require_permission(user, 'can_create')
     data = payload.model_dump()
     if user['property_name']:
         data['property_name'] = user['property_name']
@@ -344,8 +426,8 @@ def add_contract(payload: Contract, authorization: str | None = Header(None)):
     data['end_date'] = data['end_date'] or None
     now = datetime.now(timezone.utc).isoformat()
     with db() as con:
-        cur=con.execute('''INSERT INTO contracts(name,contractor_name,contractor_phone,department,value,currency,tax_percent,start_date,end_date,property_name,notes,created_at,updated_at) OUTPUT INSERTED.id VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
-            data['name'],data['contractor_name'],data['contractor_phone'],data['department'],data['value'],data['currency'],data['tax_percent'],data['start_date'],data['end_date'],data['property_name'],data['notes'],now,now))
+        cur=con.execute('''INSERT INTO contracts(name,contractor_name,contractor_phone,department,value,currency,tax_percent,start_date,end_date,property_name,notes,created_at,updated_at,created_by,updated_by) OUTPUT INSERTED.id VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
+            data['name'],data['contractor_name'],data['contractor_phone'],data['department'],data['value'],data['currency'],data['tax_percent'],data['start_date'],data['end_date'],data['property_name'],data['notes'],now,now,user['username'],user['username']))
         contract_id=cur.fetchone()['id']
         con.execute('UPDATE contracts SET department_id=(SELECT id FROM departments WHERE name=?),currency_code=? WHERE id=?',(data['department'],data['currency'],contract_id))
     write_audit(user,'created','contract',contract_id,data['name'],data['property_name'])
@@ -359,12 +441,14 @@ def contract_access(user: dict[str, Any], contract_id: int) -> dict[str, Any]:
         raise HTTPException(404, 'Contract not found')
     if user['property_name'] and contract['property_name'] != user['property_name']:
         raise HTTPException(403, 'You cannot modify a contract from another property')
+    if not user['property_name'] and not user['all_properties'] and contract['property_name'] not in user.get('property_names',[]):
+        raise HTTPException(403, 'You cannot access a contract from another property')
     return contract
 
 
 @app.put('/api/contracts/{contract_id}')
 def edit_contract(contract_id: int, payload: Contract, authorization: str | None = Header(None)):
-    user=auth(authorization); contract_access(user,contract_id); data=payload.model_dump(); now=datetime.now(timezone.utc).isoformat()
+    user=auth(authorization); require_permission(user,'can_edit'); contract_access(user,contract_id); data=payload.model_dump(); now=datetime.now(timezone.utc).isoformat()
     if user['property_name']:
         data['property_name']=user['property_name']
     if not data['property_name']:
@@ -376,10 +460,11 @@ def edit_contract(contract_id: int, payload: Contract, authorization: str | None
         if not con.execute('SELECT code FROM currencies WHERE code=? AND active=1',(data['currency'],)).fetchone(): raise HTTPException(400,'Please select a valid currency')
     data['start_date']=data['start_date'] or None; data['end_date']=data['end_date'] or None
     with db() as con:
-        con.execute('''UPDATE contracts SET name=?,contractor_name=?,contractor_phone=?,department=?,value=?,currency=?,tax_percent=?,start_date=?,end_date=?,property_name=?,notes=?,archive_exempt=0,updated_at=? WHERE id=?''',(
-            data['name'],data['contractor_name'],data['contractor_phone'],data['department'],data['value'],data['currency'],data['tax_percent'],data['start_date'],data['end_date'],data['property_name'],data['notes'],now,contract_id))
+        old=con.execute('SELECT name,contractor_name,value,start_date,end_date,property_name FROM contracts WHERE id=?',(contract_id,)).fetchone()
+        con.execute('''UPDATE contracts SET name=?,contractor_name=?,contractor_phone=?,department=?,value=?,currency=?,tax_percent=?,start_date=?,end_date=?,property_name=?,notes=?,archive_exempt=0,updated_at=?,updated_by=? WHERE id=?''',(
+            data['name'],data['contractor_name'],data['contractor_phone'],data['department'],data['value'],data['currency'],data['tax_percent'],data['start_date'],data['end_date'],data['property_name'],data['notes'],now,user['username'],contract_id))
         con.execute('UPDATE contracts SET department_id=(SELECT id FROM departments WHERE name=?),currency_code=? WHERE id=?',(data['department'],data['currency'],contract_id))
-    write_audit(user,'updated','contract',contract_id,data['name'],data['property_name'])
+    write_audit(user,'updated','contract',contract_id,json.dumps({'before':old,'after':{k:data[k] for k in ('name','contractor_name','value','start_date','end_date','property_name')}},default=str),data['property_name'])
     return {'success':True}
 
 
@@ -514,6 +599,7 @@ async def extract_contract_document(file: UploadFile = File(...), authorization:
 @app.post('/api/contracts/{contract_id}/attachment')
 async def upload_contract_attachment(contract_id: int, file: UploadFile = File(...), authorization: str | None = Header(None)):
     user = auth(authorization)
+    require_permission(user,'can_edit')
     contract_access(user, contract_id)
     data = await file.read(MAX_ATTACHMENT_SIZE + 1)
     if not data:
@@ -545,6 +631,7 @@ def download_contract_attachment(contract_id: int, authorization: str | None = H
 @app.delete('/api/contracts/{contract_id}/attachment')
 def delete_contract_attachment(contract_id: int, authorization: str | None = Header(None)):
     user = auth(authorization)
+    require_permission(user,'can_edit')
     contract_access(user, contract_id)
     with db() as con:
         con.execute('UPDATE contracts SET attachment_name=NULL,attachment_content_type=NULL,attachment_data=NULL,attachment_size=NULL,updated_at=? WHERE id=?',
@@ -555,16 +642,16 @@ def delete_contract_attachment(contract_id: int, authorization: str | None = Hea
 
 @app.delete('/api/contracts/{contract_id}')
 def archive_contract(contract_id:int, authorization: str | None = Header(None)):
-    user=auth(authorization); contract_access(user,contract_id)
+    user=auth(authorization); require_permission(user,'can_archive'); contract_access(user,contract_id)
     now=datetime.now(timezone.utc).isoformat()
-    with db() as con: con.execute('UPDATE contracts SET archived=1,archived_at=?,archive_exempt=0,updated_at=? WHERE id=?',(now,now,contract_id))
+    with db() as con: con.execute('UPDATE contracts SET archived=1,archived_at=?,archived_by=?,archive_exempt=0,updated_at=?,updated_by=? WHERE id=?',(now,user['username'],now,user['username'],contract_id))
     write_audit(user,'archived','contract',contract_id)
     return {'success':True}
 
 
 @app.delete('/api/contracts/{contract_id}/permanent')
 def permanently_delete_contract(contract_id:int, authorization: str | None = Header(None)):
-    user=auth(authorization); contract_access(user,contract_id)
+    user=auth(authorization); require_permission(user,'can_delete'); contract_access(user,contract_id)
     with db() as con:
         row=con.execute('SELECT name,property_name FROM contracts WHERE id=?',(contract_id,)).fetchone()
         if not row:
@@ -576,8 +663,8 @@ def permanently_delete_contract(contract_id:int, authorization: str | None = Hea
 
 @app.post('/api/contracts/{contract_id}/restore')
 def restore_contract(contract_id:int, authorization: str | None = Header(None)):
-    user=auth(authorization); contract=contract_access(user,contract_id); now=datetime.now(timezone.utc).isoformat()
-    with db() as con: con.execute('UPDATE contracts SET archived=0,archived_at=NULL,archive_exempt=1,updated_at=? WHERE id=?',(now,contract_id))
+    user=auth(authorization); require_permission(user,'can_restore'); contract=contract_access(user,contract_id); now=datetime.now(timezone.utc).isoformat()
+    with db() as con: con.execute('UPDATE contracts SET archived=0,archived_at=NULL,archived_by=NULL,archive_exempt=1,updated_at=?,updated_by=? WHERE id=?',(now,user['username'],contract_id))
     write_audit(user,'restored','contract',contract_id,'Restored from archive',contract['property_name'])
     return {'success':True}
 
@@ -603,7 +690,7 @@ def stats(authorization: str | None = Header(None)):
 
 def admin(authorization: str | None) -> dict[str, Any]:
     user=auth(authorization)
-    if user['role']!='admin': raise HTTPException(403,'Admin required')
+    require_permission(user,'can_manage_users')
     return user
 
 
@@ -692,30 +779,69 @@ def delete_currency(code:str, authorization: str | None = Header(None)):
 @app.get('/api/users')
 def users(authorization: str | None = Header(None)):
     admin(authorization)
-    with db() as con: return [dict(x) for x in con.execute('SELECT id,username,role,group_name,property_name FROM users ORDER BY username')]
+    with db() as con:
+        rows=[dict(x) for x in con.execute('''SELECT id,username,role,group_name,property_name,all_properties,
+            can_view,can_create,can_edit,can_archive,can_restore,can_delete,can_manage_users
+            FROM users ORDER BY username''')]
+        for row in rows:
+            row['property_names']=[x['property_name'] for x in con.execute('SELECT property_name FROM user_properties WHERE user_id=? ORDER BY property_name',(row['id'],))]
+    return rows
+
+
+def save_user_properties(con: SqlConnection, user_id: int, names: list[str]) -> list[str]:
+    cleaned=list(dict.fromkeys(name.strip() for name in names if name.strip()))
+    if cleaned:
+        placeholders=','.join('?' for _ in cleaned)
+        found={x['name'] for x in con.execute(f'SELECT name FROM properties WHERE name IN ({placeholders})',tuple(cleaned))}
+        if found != set(cleaned):
+            raise HTTPException(400,'One or more selected properties do not exist')
+    con.execute('DELETE FROM user_properties WHERE user_id=?',(user_id,))
+    for name in cleaned:
+        con.execute('INSERT INTO user_properties(user_id,property_name) VALUES(?,?)',(user_id,name))
+    return cleaned
 
 
 @app.post('/api/users')
 def add_user(p:UserPayload, authorization: str | None = Header(None)):
     actor=admin(authorization)
+    if p.role not in {'admin','it_admin','financial_manager','general_manager','department_head'}: raise HTTPException(400,'Invalid role')
     with db() as con:
-        cur=con.execute('INSERT INTO users(username,password_hash,role,group_name,property_name) OUTPUT INSERTED.id VALUES(?,?,?,?,?)',(p.username,password_hash(p.password or 'Welcome@123'),p.role,p.group_name,p.property_name)); user_id=cur.fetchone()['id']
-    write_audit(actor,'created','user',user_id,p.username,p.property_name)
+        cur=con.execute('''INSERT INTO users(username,password_hash,role,group_name,property_name,all_properties,
+            can_view,can_create,can_edit,can_archive,can_restore,can_delete,can_manage_users)
+            OUTPUT INSERTED.id VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (p.username.strip(),password_hash(p.password or 'Welcome@123'),p.role,p.group_name,p.property_name,
+             p.all_properties,p.can_view,p.can_create,p.can_edit,p.can_archive,p.can_restore,p.can_delete,p.can_manage_users)); user_id=cur.fetchone()['id']
+        names=save_user_properties(con,user_id,p.property_names or ([p.property_name] if p.property_name else []))
+    write_audit(actor,'created','user',user_id,json.dumps({'username':p.username,'role':p.role,'properties':names,'all_properties':p.all_properties}),p.property_name)
     return {'success':True}
 
 
 @app.put('/api/users/{user_id}')
 def update_user(user_id:int, p:UserPayload, authorization: str | None = Header(None)):
     actor=admin(authorization)
-    with db() as con:
-        existing=con.execute('SELECT id,username,role FROM users WHERE id=?',(user_id,)).fetchone()
-        if not existing: raise HTTPException(404,'User not found')
-        if existing['role']=='admin' and p.role!='admin' and con.execute("SELECT COUNT(*) AS count FROM users WHERE role='admin'").fetchone()['count']<=1: raise HTTPException(400,'The last administrator cannot be downgraded')
-        if p.password: con.execute('UPDATE users SET username=?,password_hash=?,role=?,group_name=?,property_name=? WHERE id=?',(p.username,password_hash(p.password),p.role,p.group_name,p.property_name,user_id))
-        else: con.execute('UPDATE users SET username=?,role=?,group_name=?,property_name=? WHERE id=?',(p.username,p.role,p.group_name,p.property_name,user_id))
+    if p.role not in {'admin','it_admin','financial_manager','general_manager','department_head'}: raise HTTPException(400,'Invalid role')
+    username=p.username.strip()
+    if not username: raise HTTPException(400,'Username is required')
+    try:
+        with db() as con:
+            existing=con.execute('SELECT id,username,role,can_manage_users FROM users WHERE id=?',(user_id,)).fetchone()
+            if not existing: raise HTTPException(404,'User not found')
+            duplicate=con.execute('SELECT id FROM users WHERE username=? AND id<>?',(username,user_id)).fetchone()
+            if duplicate: raise HTTPException(409,'This username is already used by another account')
+            if existing['can_manage_users'] and not p.can_manage_users and con.execute('SELECT COUNT(*) AS count FROM users WHERE can_manage_users=1').fetchone()['count']<=1: raise HTTPException(400,'The last user administrator cannot lose user-management permission')
+            values=(username,p.role,p.group_name.strip(),p.property_name.strip(),int(p.all_properties),int(p.can_view),int(p.can_create),int(p.can_edit),int(p.can_archive),int(p.can_restore),int(p.can_delete),int(p.can_manage_users))
+            if p.password:
+                con.execute('''UPDATE users SET username=?,role=?,group_name=?,property_name=?,all_properties=?,can_view=?,can_create=?,can_edit=?,can_archive=?,can_restore=?,can_delete=?,can_manage_users=?,password_hash=? WHERE id=?''',values+(password_hash(p.password),user_id))
+            else:
+                con.execute('''UPDATE users SET username=?,role=?,group_name=?,property_name=?,all_properties=?,can_view=?,can_create=?,can_edit=?,can_archive=?,can_restore=?,can_delete=?,can_manage_users=? WHERE id=?''',values+(user_id,))
+            names=save_user_properties(con,user_id,p.property_names or ([p.property_name] if p.property_name else []))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400,f'Could not update user: {exc}') from exc
     for session in SESSIONS.values():
         if session['username']==existing['username']: session['username']=p.username
-    write_audit(actor,'updated','user',user_id,p.username,p.property_name)
+    write_audit(actor,'updated','user',user_id,json.dumps({'username':p.username,'role':p.role,'properties':names,'all_properties':p.all_properties,'permissions':{'view':p.can_view,'create':p.can_create,'edit':p.can_edit,'archive':p.can_archive,'restore':p.can_restore,'delete':p.can_delete,'manage_users':p.can_manage_users}}),p.property_name)
     return {'success':True}
 
 
@@ -796,7 +922,7 @@ def update_property(name:str, p:NamedPayload, authorization: str | None = Header
         existing=con.execute('SELECT id,name FROM properties WHERE name=?',(name,)).fetchone()
         if not existing: raise HTTPException(404,'Property not found')
         if new_name!=name and con.execute('SELECT id FROM properties WHERE name=?',(new_name,)).fetchone(): raise HTTPException(409,'Property name already exists')
-        con.execute('UPDATE properties SET name=?,logo=? WHERE id=?',(new_name,p.logo,existing['id'])); con.execute('UPDATE contracts SET property_name=? WHERE property_name=?',(new_name,name)); con.execute('UPDATE users SET property_name=? WHERE property_name=?',(new_name,name)); con.execute('UPDATE property_logos SET property_name=? WHERE property_name=?',(new_name,name))
+        con.execute('UPDATE properties SET name=?,logo=? WHERE id=?',(new_name,p.logo,existing['id'])); con.execute('UPDATE contracts SET property_name=? WHERE property_name=?',(new_name,name)); con.execute('UPDATE users SET property_name=? WHERE property_name=?',(new_name,name)); con.execute('UPDATE user_properties SET property_name=? WHERE property_name=?',(new_name,name)); con.execute('UPDATE property_logos SET property_name=? WHERE property_name=?',(new_name,name))
     for session in SESSIONS.values():
         if session['property_name']==name: session['property_name']=new_name
     write_audit(actor,'updated','property',existing['id'],f'{name} → {new_name}',new_name)
@@ -810,7 +936,7 @@ def delete_property(name:str, authorization: str | None = Header(None)):
         existing=con.execute('SELECT id FROM properties WHERE name=?',(name,)).fetchone()
         if not existing: raise HTTPException(404,'Property not found')
         if con.execute('SELECT COUNT(*) AS count FROM contracts WHERE property_name=?',(name,)).fetchone()['count']: raise HTTPException(400,'This property is used by contracts and cannot be deleted')
-        if con.execute('SELECT COUNT(*) AS count FROM users WHERE property_name=?',(name,)).fetchone()['count']: raise HTTPException(400,'This property is assigned to users and cannot be deleted')
+        if con.execute('SELECT COUNT(*) AS count FROM users WHERE property_name=?',(name,)).fetchone()['count'] or con.execute('SELECT COUNT(*) AS count FROM user_properties WHERE property_name=?',(name,)).fetchone()['count']: raise HTTPException(400,'This property is assigned to users and cannot be deleted')
         con.execute('DELETE FROM property_logos WHERE property_name=?',(name,)); con.execute('DELETE FROM properties WHERE id=?',(existing['id'],))
     write_audit(actor,'deleted','property',existing['id'],name,name)
     return {'success':True}
@@ -869,7 +995,7 @@ def active_property(authorization: str | None = Header(None)):
 BACKUP_TABLES = {
     'properties': True, 'groups_tbl': True, 'users': True, 'departments': True,
     'currencies': False, 'system_settings': False, 'contracts': True,
-    'property_logos': True, 'audit_logs': True,
+    'property_logos': True, 'audit_logs': True, 'user_properties': False,
 }
 BACKUP_DATETIMEOFFSET_COLUMNS = {
     'departments': {'created_at'}, 'currencies': {'created_at'},
@@ -925,10 +1051,11 @@ def apply_database_backup(raw: bytes, user: dict[str, Any], filename: str) -> No
             payload=json.loads(archive.read(info).decode('utf-8'))
         if payload.get('format')!='maintenance-contract-backup' or payload.get('version')!=1: raise ValueError('Unsupported backup format')
         tables=payload.get('tables',{})
+        tables.setdefault('user_properties',[])
         if not all(table in tables and isinstance(tables[table],list) for table in BACKUP_TABLES): raise ValueError('Backup is incomplete')
     except Exception as exc: raise HTTPException(400,f'Invalid backup file: {exc}')
-    delete_order=['audit_logs','property_logos','contracts','users','groups_tbl','properties','departments','currencies','system_settings']
-    insert_order=['properties','groups_tbl','users','departments','currencies','system_settings','contracts','property_logos','audit_logs']
+    delete_order=['audit_logs','property_logos','contracts','user_properties','users','groups_tbl','properties','departments','currencies','system_settings']
+    insert_order=['properties','groups_tbl','users','user_properties','departments','currencies','system_settings','contracts','property_logos','audit_logs']
     try:
         with db() as con:
             schema={table:{row['name'] for row in con.execute('SELECT name FROM sys.columns WHERE object_id=OBJECT_ID(?)',(table,))} for table in BACKUP_TABLES}
@@ -942,6 +1069,8 @@ def apply_database_backup(raw: bytes, user: dict[str, Any], filename: str) -> No
                 placeholders=','.join('?' for _ in columns); names=','.join(f'[{column}]' for column in columns)
                 for row in rows: con.execute(f'INSERT INTO [{table}]({names}) VALUES({placeholders})',tuple(backup_decode(row.get(column)) for column in columns))
                 if BACKUP_TABLES[table]: con.execute(f'SET IDENTITY_INSERT [{table}] OFF')
+            con.execute("UPDATE users SET all_properties=1,can_view=1,can_create=1,can_edit=1,can_archive=1,can_restore=1,can_delete=1,can_manage_users=1 WHERE role='admin'")
+            con.execute("INSERT INTO user_properties(user_id,property_name) SELECT id,property_name FROM users u WHERE property_name<>'' AND NOT EXISTS(SELECT 1 FROM user_properties up WHERE up.user_id=u.id AND up.property_name=u.property_name)")
     except Exception as exc: raise HTTPException(400,f'Database restore failed: {exc}')
     write_audit(user,'database restored','database',None,filename)
 
@@ -1095,4 +1224,8 @@ async def import_csv(file:UploadFile=File(...), authorization: str | None = Head
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 
 @app.get('/')
-def home(): return FileResponse(ROOT/'static/index.html')
+def home():
+    return FileResponse(
+        ROOT/'static/index.html',
+        headers={'Cache-Control':'no-store, no-cache, must-revalidate, max-age=0','Pragma':'no-cache'},
+    )
