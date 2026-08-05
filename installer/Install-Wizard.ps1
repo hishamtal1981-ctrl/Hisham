@@ -1,4 +1,4 @@
-﻿#requires -version 5.1
+#requires -version 5.1
 param([switch]$Elevated)
 
 $ErrorActionPreference = 'Stop'
@@ -62,6 +62,34 @@ function Find-SqlServer {
     return $null
 }
 
+function New-StartMenuShortcut([string]$Path,[string]$Target,[string]$Arguments='',[string]$WorkingDirectory='') {
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($Path)
+    $shortcut.TargetPath = $Target
+    if ($Arguments) { $shortcut.Arguments = $Arguments }
+    if ($WorkingDirectory) { $shortcut.WorkingDirectory = $WorkingDirectory }
+    $shortcut.Save()
+}
+
+function Start-DetectedSqlService([string]$SqlServer) {
+    if (-not $SqlServer) { return }
+    $serviceName = $null
+    if ($SqlServer -in @('localhost','.','(local)',$env:COMPUTERNAME)) {
+        $serviceName = 'MSSQLSERVER'
+    } elseif ($SqlServer -match '^(?:\.\\|localhost\\|[^\\]+\\)([^\\]+)$') {
+        $serviceName = 'MSSQL$' + $Matches[1]
+    }
+    if (-not $serviceName) { return }
+    $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if (-not $service) { return }
+    if ($service.Status -ne 'Running') {
+        Write-SetupLog "Starting SQL Server service $serviceName..."
+        Start-Service -Name $serviceName
+    }
+    $service.WaitForStatus('Running',[TimeSpan]::FromMinutes(2))
+    Write-SetupLog "SQL Server service $serviceName is running."
+}
+
 function Get-Package([string[]]$Names) {
     foreach ($name in $Names) {
         $candidate = Join-Path $PSScriptRoot "packages\$name"
@@ -116,6 +144,59 @@ function Ensure-OdbcDriver {
     Write-SetupLog 'Installing Microsoft ODBC Driver 18...'
     $process = Start-Process msiexec.exe -ArgumentList @('/i',('"{0}"' -f $installer),'/qn','IACCEPTMSODBCSQLLICENSETERMS=YES','ADDLOCAL=ALL') -Wait -PassThru
     if ($process.ExitCode -notin @(0,3010)) { throw "ODBC Driver setup failed with exit code $($process.ExitCode)." }
+}
+
+function Find-Ssms {
+    $candidates = @(
+        "$env:ProgramFiles\Microsoft SQL Server Management Studio 22\Release\Common7\IDE\Ssms.exe",
+        "$env:ProgramFiles\Microsoft SQL Server Management Studio 21\Common7\IDE\Ssms.exe",
+        "${env:ProgramFiles(x86)}\Microsoft SQL Server Management Studio 20\Common7\IDE\Ssms.exe",
+        "${env:ProgramFiles(x86)}\Microsoft SQL Server Management Studio 19\Common7\IDE\Ssms.exe",
+        "${env:ProgramFiles(x86)}\Microsoft SQL Server\160\Tools\Binn\ManagementStudio\Ssms.exe",
+        "${env:ProgramFiles(x86)}\Microsoft SQL Server\150\Tools\Binn\ManagementStudio\Ssms.exe"
+    )
+    $found = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+    if ($found) { return $found }
+
+    foreach ($root in @($env:ProgramFiles,${env:ProgramFiles(x86)})) {
+        if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+        $found = Get-ChildItem -LiteralPath $root -Filter 'Ssms.exe' -File -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+        if ($found) { return $found }
+    }
+    return $null
+}
+
+function Ensure-Ssms {
+    $ssms = Find-Ssms
+    if ($ssms) {
+        Write-SetupLog "SQL Server Management Studio found: $ssms"
+        return $ssms
+    }
+
+    $bootstrapper = Get-Package @('vs_SSMS.exe')
+    if (-not $bootstrapper) {
+        $bootstrapper = Join-Path $env:TEMP 'vs_SSMS.exe'
+        Write-SetupLog 'Downloading SQL Server Management Studio 22 from Microsoft...'
+        Invoke-WebRequest 'https://aka.ms/ssms/22/release/vs_SSMS.exe' -OutFile $bootstrapper -UseBasicParsing
+    }
+
+    Write-SetupLog 'Installing SQL Server Management Studio 22. This can take several minutes...'
+    $arguments = '--quiet --wait --norestart --installPath "C:\Program Files\Microsoft SQL Server Management Studio 22\Release" --addProductLang en-us'
+    $process = Start-Process $bootstrapper -ArgumentList $arguments -Wait -PassThru
+    if ($process.ExitCode -notin @(0,3010)) {
+        throw "SQL Server Management Studio setup failed with exit code $($process.ExitCode)."
+    }
+
+    $ssms = Find-Ssms
+    if (-not $ssms) {
+        if ($process.ExitCode -eq 3010) {
+            throw 'SQL Server Management Studio was installed and Windows must be restarted. Restart the server, then run the wizard again to create the shortcuts.'
+        }
+        throw 'SQL Server Management Studio setup completed, but Ssms.exe could not be located.'
+    }
+    Write-SetupLog "SQL Server Management Studio installed: $ssms"
+    return $ssms
 }
 
 function Ensure-Python {
@@ -183,10 +264,18 @@ $installButton.Add_Click({
         Start-Sleep -Seconds 2
         $sqlServer = Find-SqlServer
         if (-not $sqlServer) {
+            Write-SetupLog 'No SQL Server Database Engine instance was found.'
             if (-not $installSql.Checked) { $sqlServer = $serverBox.Text.Trim() }
-            else { $sqlServer = Install-SqlExpress }
-        } elseif ($serverBox.Text.Trim()) { $sqlServer = $serverBox.Text.Trim() }
+            else {
+                Write-SetupLog 'SQL Server will be downloaded and installed because it is missing.'
+                $sqlServer = Install-SqlExpress
+            }
+        } else {
+            Write-SetupLog "Existing SQL Server instance detected: $sqlServer. SQL Server download will be skipped."
+            if ($serverBox.Text.Trim()) { $sqlServer = $serverBox.Text.Trim() }
+        }
         Write-SetupLog "Using SQL Server: $sqlServer"
+        Start-DetectedSqlService $sqlServer
         New-Item -ItemType Directory -Path $target -Force | Out-Null
         Write-SetupLog "Copying application to $target..."
         foreach ($item in @('server.py','requirements.txt','database_setup.sql','static','installer')) {
@@ -221,7 +310,7 @@ $installButton.Add_Click({
         Write-SetupLog 'Python packages verified.'
         $env:SQLSERVER_HOST = $sqlServer
         $env:SQLSERVER_DATABASE = $database
-        Write-SetupLog 'Creating database and application tables...'
+        Write-SetupLog 'Checking the database. Missing objects will be created and existing data will be preserved...'
         & $venvPython (Join-Path $target 'installer\configure_database.py')
         if ($LASTEXITCODE -ne 0) { throw 'Database configuration failed.' }
         $runner = @"
@@ -247,8 +336,8 @@ set "SQLSERVER_DATABASE=$database"
         Start-ScheduledTask -TaskName 'Maintenance Contract Server'
         $serverStarted = $false
         $localUrl = "http://127.0.0.1:$port/"
-        foreach ($attempt in 1..30) {
-            Start-Sleep -Milliseconds 500
+        foreach ($attempt in 1..120) {
+            Start-Sleep -Seconds 1
             try {
                 $response = Invoke-WebRequest -Uri $localUrl -UseBasicParsing -TimeoutSec 5
                 if ($response.StatusCode -eq 200) {
@@ -275,8 +364,55 @@ set "SQLSERVER_DATABASE=$database"
         Write-SetupLog "Installation completed. Local URL: $localUrl"
         Write-SetupLog "Network IP URL: $networkUrl"
         Write-SetupLog "Computer name URL: $computerUrl"
+        $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Maintenance Contract'
+        New-Item -ItemType Directory -Path $startMenu -Force | Out-Null
+        New-StartMenuShortcut (Join-Path $startMenu 'Open Maintenance Contract.lnk') "$env:SystemRoot\System32\cmd.exe" ('/c start "" "{0}"' -f $networkUrl) $target
+        New-StartMenuShortcut (Join-Path $startMenu 'Application Folder.lnk') "$env:SystemRoot\explorer.exe" ('"{0}"' -f $target) $target
+        $sqlManager = @(
+            "$env:SystemRoot\SysWOW64\SQLServerManager16.msc",
+            "$env:SystemRoot\SysWOW64\SQLServerManager15.msc",
+            "$env:SystemRoot\SysWOW64\SQLServerManager14.msc",
+            "$env:SystemRoot\System32\SQLServerManager16.msc"
+        ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ($sqlManager) {
+            New-StartMenuShortcut (Join-Path $startMenu 'SQL Server Configuration Manager.lnk') "$env:SystemRoot\System32\mmc.exe" ('"{0}"' -f $sqlManager)
+        }
+        $ssms = Ensure-Ssms
+        New-StartMenuShortcut (Join-Path $startMenu 'SQL Server Management Studio.lnk') $ssms
+        $connectionInfo = @"
+Maintenance Contract SQL Connection
+===================================
+Server / Instance: $sqlServer
+Authentication: Windows Authentication
+Database: $database
+
+In SQL Server Management Studio, use the exact Server / Instance value above,
+then expand Databases and select [$database].
+"@
+        Set-Content -Path (Join-Path $target 'SQL-CONNECTION.txt') -Value $connectionInfo -Encoding UTF8
+        $databaseLauncher = @"
+@echo off
+set "SQL_SERVER=$sqlServer"
+set "SQL_DATABASE=$database"
+if exist "$ssms" (
+  start "" "$ssms" -S "$sqlServer" -d "$database" -E
+  exit /b 0
+)
+echo SQL Server Management Studio was not found on this server.
+echo.
+echo Connect with these values after installing SSMS:
+echo Server: $sqlServer
+echo Authentication: Windows Authentication
+echo Database: $database
+echo.
+pause
+"@
+        $databaseLauncherPath = Join-Path $target 'OPEN-SQL-DATABASE.cmd'
+        Set-Content -Path $databaseLauncherPath -Value $databaseLauncher -Encoding ASCII
+        New-StartMenuShortcut (Join-Path $startMenu 'Open Database in SSMS.lnk') "$env:SystemRoot\System32\cmd.exe" ('/c "{0}"' -f $databaseLauncherPath) $target
+        Write-SetupLog 'Windows Start menu shortcuts were created.'
         Start-Process $localUrl
-        [Windows.Forms.MessageBox]::Show("Installation completed and the application opened successfully.`nThis computer: $localUrl`nNetwork clients: $networkUrl`nComputer name: $computerUrl",'Maintenance Contract') | Out-Null
+        [Windows.Forms.MessageBox]::Show("Installation completed and the application opened successfully.`nThis computer: $localUrl`nNetwork clients: $networkUrl`nComputer name: $computerUrl`n`nSQL Server / Instance: $sqlServer`nDatabase: $database`nUse the Start menu shortcut: Open Database in SSMS",'Maintenance Contract') | Out-Null
     } catch {
         Write-SetupLog "ERROR: $($_.Exception.Message)"
         [Windows.Forms.MessageBox]::Show($_.Exception.Message,'Setup failed','OK','Error') | Out-Null
