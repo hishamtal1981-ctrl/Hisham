@@ -47,10 +47,13 @@ def connect_with_retry(target_database: str, attempts: int = 60):
 
 
 with connect_with_retry("master") as connection:
+    database_exists = bool(connection.execute("SELECT DB_ID(?)", database).fetchone()[0])
     escaped_database = database.replace("]", "]]" )
-    connection.execute(
-        f"IF DB_ID(?) IS NULL EXEC('CREATE DATABASE [{escaped_database}]')", database
-    )
+    if database_exists:
+        print(f"Existing database [{database}] found. Existing data will be preserved.", flush=True)
+    else:
+        print(f"Database [{database}] was not found. Creating it now...", flush=True)
+        connection.execute(f"CREATE DATABASE [{escaped_database}]")
     connection.execute(
         "IF SUSER_ID(N'NT AUTHORITY\\SYSTEM') IS NULL "
         "CREATE LOGIN [NT AUTHORITY\\SYSTEM] FROM WINDOWS"
@@ -66,7 +69,9 @@ with connect_with_retry(database) as connection:
         "ALTER ROLE db_owner ADD MEMBER [NT AUTHORITY\\SYSTEM]"
     )
 
+print("Applying additive schema updates only; no existing rows are deleted or replaced.", flush=True)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server as application  # noqa: E402,F401
 
-print(f"Database [{database}] is ready on {server}.")
+result = "updated safely" if database_exists else "created"
+print(f"Database [{database}] is ready on {server} ({result}).")
