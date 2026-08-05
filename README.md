@@ -15,7 +15,7 @@ uvicorn server:app --reload
 
 للتثبيت السريع على Windows، شغّل `setup_database.bat` مرة واحدة ثم `start.bat`. ينشئ ملف التشغيل بيئة Python ويثبت المتطلبات تلقائيًا في أول مرة.
 
-للتثبيت على خادم Windows جديد، شغّل `INSTALL-WIZARD.cmd`. يكتشف المعالج SQL Server أو يثبت SQL Server 2022 Express، وينشئ قاعدة البيانات، ويسجل تشغيل البرنامج تلقائيًا عند بدء الخادم. يدعم التثبيت دون إنترنت عند إضافة المثبتات الرسمية إلى `installer\packages`.
+للتثبيت على خادم Windows جديد، شغّل `INSTALL-WIZARD.cmd`. يكتشف المعالج SQL Server أو يثبت SQL Server 2022 Express، ويثبت SQL Server Management Studio 22 عند عدم وجوده، وينشئ قاعدة البيانات، ويسجل تشغيل البرنامج تلقائيًا عند بدء الخادم. يدعم التثبيت دون إنترنت عند إضافة المثبتات الرسمية إلى `installer\packages`.
 
 - المستخدم الابتدائي: `admin`
 - كلمة المرور الابتدائية: `Admin@123`

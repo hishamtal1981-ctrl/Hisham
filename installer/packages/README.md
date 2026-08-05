@@ -8,4 +8,6 @@ Place optional offline installers here before packaging:
 - `msodbcsql18.msi` — optional ODBC Driver 18 installer when SQL setup does not provide a supported driver.
 - `wheels/` — Python wheel files for every package in `requirements.txt` and its dependencies.
 
-When files are absent, the wizard downloads the SQL Express and Python installers. The wizard never downloads from non-official domains.
+You can also add the official SQL Server Management Studio 22 bootstrapper as `vs_SSMS.exe`.
+
+When files are absent, the wizard downloads the SQL Express, ODBC, SSMS, and Python installers. The wizard never downloads from non-official domains.
